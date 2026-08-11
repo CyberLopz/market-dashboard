@@ -506,9 +506,73 @@ function drawChart() {
   chart.timeScale().fitContent();
 }
 
+// Applies only the bars that changed since the last draw, via lightweight-charts'
+// incremental `.update()` — unlike drawChart(), this never calls fitContent(),
+// so the user's zoom/pan stays put while fresh ticks stream in. This is what
+// makes the live-poll loop below feel live instead of jarring.
+function applyIncrementalBars(newBars, range) {
+  if (!newBars.length) return;
+  const prevLastTime = currentBars.length ? toChartTime(currentBars[currentBars.length - 1].t, range) : null;
+  let startIdx = 0;
+  if (prevLastTime != null) {
+    const idx = newBars.findIndex(b => toChartTime(b.t, range) === prevLastTime);
+    startIdx = idx >= 0 ? idx : Math.max(0, newBars.length - 1);
+  }
+  for (let i = startIdx; i < newBars.length; i++) {
+    const b = newBars[i];
+    const t = toChartTime(b.t, range);
+    if (chartType === "candle") {
+      priceSeries.update({ time: t, open: b.o, high: b.h, low: b.l, close: b.c });
+    } else {
+      priceSeries.update({ time: t, value: b.c });
+    }
+    volumeSeries.update({
+      time: t, value: b.v,
+      color: b.c >= b.o ? "rgba(62, 207, 178, 0.5)" : "rgba(255, 122, 110, 0.5)",
+    });
+  }
+  currentBars = newBars;
+  updateMAs();
+  updateReferenceLines();
+  updateStatsBar();
+  updateLegend(currentBars[currentBars.length - 1]);
+}
+
+// Fast polling for the actively-viewed chart, "as live as possible" without
+// a WebSocket relay: Alpaca allows only one streaming connection per API
+// key, so a true live feed would need a Durable Object to fan out a single
+// shared upstream connection — real infra for a single-user dashboard.
+// Polling one symbol's bars every few seconds (well under the 200/min free
+// tier limit) gets most of the benefit with none of that risk. Only runs
+// for intraday ranges — daily/weekly bars don't change fast enough to
+// justify it, and the main 15s refresh loop already keeps those current.
+const LIVE_POLL_MS = 5000;
+let liveChartTimer = null;
+
+function stopLiveChartPolling() {
+  if (liveChartTimer) { clearInterval(liveChartTimer); liveChartTimer = null; }
+  const badge = document.getElementById("chart-live-badge");
+  if (badge) badge.hidden = true;
+}
+
+function startLiveChartPolling() {
+  stopLiveChartPolling();
+  if (!currentRange || !currentRange.intraday || !chartSymbol) return;
+  document.getElementById("chart-live-badge").hidden = false;
+  const symbol = chartSymbol, range = currentRange;
+  liveChartTimer = setInterval(async () => {
+    if (chartSymbol !== symbol || currentRange !== range) { stopLiveChartPolling(); return; }
+    try {
+      applyIncrementalBars(await fetchBars(symbol, range), range);
+    } catch (e) {
+      console.warn(`live chart poll failed for ${symbol}:`, e);
+    }
+  }, LIVE_POLL_MS);
+}
+
 async function loadChart() {
   ensureChart();
-  if (!chart || !chartSymbol) return;
+  if (!chart || !chartSymbol) { stopLiveChartPolling(); return; }
   currentRange = CHART_RANGES.find(r => r.id === chartRangeId) || CHART_RANGES[4];
   try {
     currentBars = await fetchBars(chartSymbol, currentRange);
@@ -517,6 +581,7 @@ async function loadChart() {
     currentBars = [];
   }
   drawChart();
+  startLiveChartPolling();
 }
 
 function selectChartSymbol(sym) {

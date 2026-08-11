@@ -269,6 +269,36 @@ h2 {
 .chart-legend .tk { color: var(--text); font-size: 12.5px; margin-right: 2px; }
 .chart-legend strong { font-weight: 600; }
 
+.live-badge {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  color: var(--gain);
+  background: rgba(11, 15, 26, 0.6);
+  padding: 4px 9px;
+  border-radius: 999px;
+  pointer-events: none;
+}
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--gain);
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
 .chart-container {
   height: 360px;
   width: 100%;
@@ -573,4 +603,5 @@ footer { margin-top: 30px; color: var(--mut); font-size: 12px; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
   .ticker-track { animation: none !important; }
+  .live-dot { animation: none !important; }
 }
