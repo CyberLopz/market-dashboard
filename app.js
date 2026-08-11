@@ -313,6 +313,7 @@ function bindRemoveButtons() {
 // ============================================================================
 const CHART_RANGES = [
   { id: "1D", label: "1D", timeframe: "5Min", lookbackDays: 6, intraday: true, singleSession: true },
+  { id: "5D", label: "5D", timeframe: "5Min", lookbackDays: 8, intraday: true },
   { id: "1W", label: "1W", timeframe: "15Min", lookbackDays: 9, intraday: true },
   { id: "1M", label: "1M", timeframe: "1Day", lookbackDays: 35 },
   { id: "3M", label: "3M", timeframe: "1Day", lookbackDays: 100 },
