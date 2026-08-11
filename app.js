@@ -484,6 +484,69 @@ document.getElementById("chart-search-form").onsubmit = (e) => {
 };
 
 // ============================================================================
+// NEWS
+// ============================================================================
+function escapeHtml(str) {
+  return String(str ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function timeAgo(iso) {
+  const min = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  return `${Math.floor(hr / 24)}d ago`;
+}
+
+async function fetchNews() {
+  const symbols = allKnownTickers();
+  const qs = symbols.length ? `&symbols=${encodeURIComponent(symbols.join(","))}` : "";
+  const res = await fetch(`${WORKER_URL}/api/news?limit=25${qs}`);
+  if (!res.ok) throw new Error(`news fetch failed: ${res.status}`);
+  const data = await res.json();
+  return data.news || [];
+}
+
+function renderNews(items) {
+  const body = document.getElementById("news-body");
+  if (!items.length) { body.innerHTML = `<p class="muted">No recent news.</p>`; return; }
+  body.innerHTML = items.map(n => {
+    const img = (n.images || []).find(i => i.size === "thumb") || (n.images || [])[0];
+    const tags = (n.symbols || []).slice(0, 4).map(s => `<span class="news-tag">${escapeHtml(s)}</span>`).join("");
+    const safeUrl = /^https?:\/\//.test(n.url || "") ? escapeHtml(n.url) : "#";
+    return `<div class="news-item">
+      <a class="news-link" href="${safeUrl}" target="_blank" rel="noopener noreferrer">
+        <div class="news-thumb ${img ? "" : "empty"}"${img ? ` style="background-image:url('${escapeHtml(img.url)}')"` : ""}></div>
+        <div class="news-body">
+          <div class="news-headline">${escapeHtml(n.headline)}</div>
+          <div class="news-meta">
+            <span class="news-source">${escapeHtml(n.source)}</span>
+            <span>·</span>
+            <span>${timeAgo(n.created_at)}</span>
+            ${tags}
+          </div>
+        </div>
+      </a>
+    </div>`;
+  }).join("");
+  document.getElementById("news-stamp").textContent = `Updated ${new Date().toLocaleTimeString()}`;
+}
+
+let lastNewsFetch = 0;
+async function maybeLoadNews() {
+  if (lastNewsFetch !== 0 && Date.now() - lastNewsFetch < 60000) return; // refresh at most once/min
+  lastNewsFetch = Date.now();
+  try {
+    renderNews(await fetchNews());
+  } catch (e) {
+    console.warn("news fetch failed:", e);
+  }
+}
+
+// ============================================================================
 // MAIN REFRESH LOOP
 // ============================================================================
 async function refresh() {
@@ -519,6 +582,7 @@ async function refresh() {
     renderTypeSelector();
     renderMaToggles();
     if (chartSymbol) loadChart();
+    maybeLoadNews();
 
     const total = stockPnl + optionPnl;
     const totalEl = document.getElementById("total-pnl");

@@ -17,6 +17,9 @@
  *   GET /api/bars?symbol=AAPL&timeframe=1Day&limit=180
  *     -> historical OHLCV bars for the candlestick chart
  *
+ *   GET /api/news?symbols=AAPL,NVDA&limit=25
+ *     -> latest market news (Benzinga, via Alpaca), optionally filtered to symbols
+ *
  * SECURITY NOTES:
  *   - Set ALPACA_KEY_ID / ALPACA_SECRET_KEY as Worker secrets
  *     (`wrangler secret put ...`), never as plaintext in this file.
@@ -90,6 +93,17 @@ async function handleBars(url, env) {
   });
 }
 
+async function handleNews(url, env) {
+  const symbols = url.searchParams.get("symbols");
+  const limit = url.searchParams.get("limit") || "25";
+  let path = `/v1beta1/news?limit=${encodeURIComponent(limit)}&sort=desc&exclude_contentless=true`;
+  if (symbols) path += `&symbols=${encodeURIComponent(symbols)}`;
+  const data = await alpacaFetch(env, path);
+  return new Response(JSON.stringify(data), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 async function handleOptions(url, env) {
   const symbol = url.searchParams.get("symbol");
   const expiration = url.searchParams.get("expiration");
@@ -121,6 +135,8 @@ export default {
         response = await handleOptions(url, env);
       } else if (url.pathname === "/api/bars") {
         response = await handleBars(url, env);
+      } else if (url.pathname === "/api/news") {
+        response = await handleNews(url, env);
       } else {
         response = new Response(JSON.stringify({ error: "not found" }), { status: 404 });
       }
