@@ -1,7 +1,7 @@
 // ============================================================================
 // CONFIG — the one thing you MUST edit before this works
 // ============================================================================
-const WORKER_URL = "https://market-dashboard-proxy.YOUR-SUBDOMAIN.workers.dev";
+const WORKER_URL = "https://market-dashboard-proxy.lopezdunn90.workers.dev";
 const REFRESH_MS = 15000; // 15s. Alpaca free tier allows 200 req/min — plenty of headroom.
 
 // ============================================================================
