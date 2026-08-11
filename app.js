@@ -311,16 +311,20 @@ function bindRemoveButtons() {
 // ============================================================================
 // CANDLESTICK CHART
 // ============================================================================
+// intervalLabel is shown on the button itself and in the chart stats bar —
+// the range presets bundle a lookback AND a bar size together, but nothing
+// in the UI surfaced the bar size before, which read as "no 5-min option"
+// even though 1D/5D already use 5-minute bars.
 const CHART_RANGES = [
-  { id: "1D", label: "1D", timeframe: "5Min", lookbackDays: 6, intraday: true, singleSession: true },
-  { id: "5D", label: "5D", timeframe: "5Min", lookbackDays: 8, intraday: true },
-  { id: "1W", label: "1W", timeframe: "15Min", lookbackDays: 9, intraday: true },
-  { id: "1M", label: "1M", timeframe: "1Day", lookbackDays: 35 },
-  { id: "3M", label: "3M", timeframe: "1Day", lookbackDays: 100 },
-  { id: "6M", label: "6M", timeframe: "1Day", lookbackDays: 200 },
-  { id: "YTD", label: "YTD", timeframe: "1Day", ytd: true },
-  { id: "1Y", label: "1Y", timeframe: "1Day", lookbackDays: 370 },
-  { id: "5Y", label: "5Y", timeframe: "1Week", lookbackDays: 1830 },
+  { id: "1D", label: "1D", timeframe: "5Min", intervalLabel: "5m", lookbackDays: 6, intraday: true, singleSession: true },
+  { id: "5D", label: "5D", timeframe: "5Min", intervalLabel: "5m", lookbackDays: 8, intraday: true },
+  { id: "1W", label: "1W", timeframe: "15Min", intervalLabel: "15m", lookbackDays: 9, intraday: true },
+  { id: "1M", label: "1M", timeframe: "1Day", intervalLabel: "1d", lookbackDays: 35 },
+  { id: "3M", label: "3M", timeframe: "1Day", intervalLabel: "1d", lookbackDays: 100 },
+  { id: "6M", label: "6M", timeframe: "1Day", intervalLabel: "1d", lookbackDays: 200 },
+  { id: "YTD", label: "YTD", timeframe: "1Day", intervalLabel: "1d", ytd: true },
+  { id: "1Y", label: "1Y", timeframe: "1Day", intervalLabel: "1d", lookbackDays: 370 },
+  { id: "5Y", label: "5Y", timeframe: "1Week", intervalLabel: "1wk", lookbackDays: 1830 },
 ];
 const CHART_TYPES = [
   { id: "candle", label: "Candles" },
@@ -467,6 +471,7 @@ function updateStatsBar() {
   const first = currentBars[0].o, last = currentBars[currentBars.length - 1].c;
   const chg = last - first, pct = first ? (chg / first) * 100 : 0;
   el.innerHTML = `
+    <span>Interval <strong class="mono">${currentRange.intervalLabel}</strong></span>
     <span>Range <strong class="mono">${money(rangeLow)}–${money(rangeHigh)}</strong></span>
     <span>Period <strong class="mono ${pnlClass(chg)}">${chg >= 0 ? "+" : ""}${money(chg)} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)</strong></span>`;
 }
@@ -535,7 +540,7 @@ function renderChartSymbolPicker() {
 function renderRangeSelector() {
   const wrap = document.getElementById("chart-ranges");
   wrap.innerHTML = CHART_RANGES.map(r =>
-    `<button data-range="${r.id}" class="${r.id === chartRangeId ? "active" : ""}">${r.label}</button>`
+    `<button data-range="${r.id}" class="${r.id === chartRangeId ? "active" : ""}" title="${r.intervalLabel} bars">${r.label}<span class="range-interval">${r.intervalLabel}</span></button>`
   ).join("");
   wrap.querySelectorAll("[data-range]").forEach(btn => btn.onclick = () => {
     chartRangeId = btn.dataset.range;
