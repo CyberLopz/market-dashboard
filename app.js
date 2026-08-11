@@ -628,11 +628,14 @@ function smaAt(closes, period, endIndexExclusive) {
   return slice.reduce((a, b) => a + b, 0) / period;
 }
 
-// Combines trend (price vs. 50-day average + its slope), momentum (RSI),
+// Combines trend (price vs. a moving average + its slope), momentum (RSI),
 // and MACD into a single read. `continuationWarning` fires only when
 // several bearish signals line up AND RSI isn't already deeply oversold
 // (extreme oversold often precedes a bounce, not more downside).
-function analyzeTrend(bars) {
+// `periodLabel` only affects the wording of the moving-average reasons —
+// the math is identical whether `bars` is daily or intraday; the caller
+// decides what a "50-period" average means by what it fetches.
+function analyzeTrend(bars, periodLabel = "50-day") {
   const closes = bars.map(b => b.c);
   if (closes.length < 30) return null;
 
@@ -650,11 +653,11 @@ function analyzeTrend(bars) {
   const reasons = [];
 
   if (sma50 != null) {
-    if (price < sma50) { bearish++; reasons.push("Below 50-day average"); }
-    else { bullish++; reasons.push("Above 50-day average"); }
+    if (price < sma50) { bearish++; reasons.push(`Below ${periodLabel} average`); }
+    else { bullish++; reasons.push(`Above ${periodLabel} average`); }
   }
   if (sma50Prev != null && sma50 != null) {
-    if (sma50 < sma50Prev) { bearish++; reasons.push("50-day average declining"); }
+    if (sma50 < sma50Prev) { bearish++; reasons.push(`${periodLabel} average declining`); }
     else { bullish++; }
   }
   if (macd) {
@@ -687,25 +690,32 @@ function analyzeTrend(bars) {
   return { trend, bearish, bullish, reasons, rsi, macd, continuationWarning, avgVolume20 };
 }
 
-async function fetchDailyBars(symbol, lookbackDays = 220) {
+async function fetchHistBars(symbol, timeframe, lookbackDays, limit) {
   const start = new Date(Date.now() - lookbackDays * 86400000).toISOString().slice(0, 10);
-  const res = await fetch(`${WORKER_URL}/api/bars?symbol=${encodeURIComponent(symbol)}&timeframe=1Day&limit=250&start=${start}`);
+  const res = await fetch(`${WORKER_URL}/api/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&limit=${limit}&start=${start}`);
   if (!res.ok) throw new Error(`bars fetch failed: ${res.status}`);
   const data = await res.json();
   return data.bars || [];
 }
+const fetchDailyBars = (symbol, lookbackDays = 220) => fetchHistBars(symbol, "1Day", lookbackDays, 250);
+// 5 calendar days comfortably covers 2-3 trading sessions of 5-min bars —
+// plenty for the 60-bar lookback analyzeTrend wants for its slope check.
+const fetchPulseBars = (symbol, lookbackDays = 5) => fetchHistBars(symbol, "5Min", lookbackDays, 500);
 
 let trendCache = {};
+let pulseCache = {};
 
-async function updateTrends() {
+async function updateCache(setCache, render, fetchBarsFor, periodLabel) {
   const symbols = allKnownTickers();
   const entries = await Promise.all(symbols.map(async sym => {
-    try { return [sym, analyzeTrend(await fetchDailyBars(sym))]; }
+    try { return [sym, analyzeTrend(await fetchBarsFor(sym), periodLabel)]; }
     catch (e) { console.warn(`trend fetch failed for ${sym}:`, e); return [sym, null]; }
   }));
-  trendCache = Object.fromEntries(entries);
-  renderTrends();
+  setCache(Object.fromEntries(entries));
+  render();
 }
+const updateTrends = () => updateCache(c => (trendCache = c), renderTrends, fetchDailyBars, "50-day");
+const updatePulse = () => updateCache(c => (pulseCache = c), renderPulse, fetchPulseBars, "50-bar");
 
 function trendRank(t) {
   if (t.continuationWarning) return 0;
@@ -714,14 +724,14 @@ function trendRank(t) {
   return 3;
 }
 
-function renderTrends() {
-  const body = document.getElementById("trends-body");
-  const rows = Object.entries(trendCache)
+function renderTrendCache(cache, bodyId, stampId) {
+  const body = document.getElementById(bodyId);
+  const rows = Object.entries(cache)
     .filter(([, t]) => t)
     .sort((a, b) => trendRank(a[1]) - trendRank(b[1]));
 
   if (!rows.length) {
-    body.innerHTML = `<p class="muted">Tracking trends — need a bit more price history to compute signals.</p>`;
+    body.innerHTML = `<p class="muted">Tracking — need a bit more price history to compute signals.</p>`;
     return;
   }
 
@@ -742,15 +752,24 @@ function renderTrends() {
       ${t.continuationWarning ? `<div class="trend-warn">&#9650; Signals suggest the downtrend may continue — a technical read, not a recommendation to sell.</div>` : ""}
     </div>`;
   }).join("");
-  document.getElementById("trends-stamp").textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  document.getElementById(stampId).textContent = `Updated ${new Date().toLocaleTimeString()}`;
 }
+const renderTrends = () => renderTrendCache(trendCache, "trends-body", "trends-stamp");
+const renderPulse = () => renderTrendCache(pulseCache, "pulse-body", "pulse-stamp");
 
-let lastTrendFetch = 0;
-async function maybeUpdateTrends() {
-  if (lastTrendFetch !== 0 && Date.now() - lastTrendFetch < 5 * 60000) return; // recompute at most every 5 min
-  lastTrendFetch = Date.now();
-  try { await updateTrends(); } catch (e) { console.warn("trend update failed:", e); }
+function makeThrottledUpdater(intervalMs, updateFn, label) {
+  let last = 0;
+  return async () => {
+    if (last !== 0 && Date.now() - last < intervalMs) return;
+    last = Date.now();
+    try { await updateFn(); } catch (e) { console.warn(`${label} update failed:`, e); }
+  };
 }
+const maybeUpdateTrends = makeThrottledUpdater(5 * 60000, updateTrends, "trend");
+// 5-min bars only gain a new bar every 5 min, so recomputing more often
+// than that just re-fetches an unchanged latest bar — matches the request
+// to "track charts every 5 minutes."
+const maybeUpdatePulse = makeThrottledUpdater(5 * 60000, updatePulse, "pulse");
 
 // ============================================================================
 // NEWS
@@ -859,6 +878,7 @@ async function refresh() {
     if (chartSymbol) loadChart();
     maybeLoadNews();
     maybeUpdateTrends();
+    maybeUpdatePulse();
 
     const total = stockPnl + optionPnl;
     const totalEl = document.getElementById("total-pnl");
