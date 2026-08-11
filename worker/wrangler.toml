@@ -1,0 +1,14 @@
+name = "market-dashboard-proxy"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# ALLOWED_ORIGIN is not a secret — set it here once you know your GitHub
+# Pages URL, e.g. "https://yourusername.github.io"
+[vars]
+ALLOWED_ORIGIN = "*"
+
+# Real secrets are NOT set here. After first deploy, run:
+#   wrangler secret put ALPACA_KEY_ID
+#   wrangler secret put ALPACA_SECRET_KEY
+# and paste each value when prompted. They're encrypted at rest by
+# Cloudflare and never appear in this file or in git.

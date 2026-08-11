@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Market Dashboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Market dashboard</h1>
+    <span id="stamp" class="stamp">Loading…</span>
+  </header>
+
+  <div class="totals">Open position P&amp;L: <strong id="total-pnl" class="mono">—</strong></div>
+  <div class="delay-note">
+    Stock quotes: live IEX feed via Alpaca. Options: Alpaca's free
+    "indicative" feed (approximate, not true real-time OPRA quotes).
+    Read-only — nothing here can place a trade.
+  </div>
+
+  <section id="alerts-section"></section>
+
+  <section>
+    <div class="section-head">
+      <h2>Watchlist</h2>
+      <button class="btn-ghost" id="edit-watchlist">Edit</button>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Ticker</th><th class="num">Price</th><th class="num">Change</th></tr>
+      </thead>
+      <tbody id="watchlist-body"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Stock positions</h2>
+      <button class="btn-ghost" id="add-stock">+ Add</button>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Ticker</th><th class="num">Shares</th><th class="num">Cost basis</th>
+        <th class="num">Price</th><th class="num">P&amp;L</th><th></th></tr>
+      </thead>
+      <tbody id="stocks-body"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Options positions</h2>
+      <button class="btn-ghost" id="add-option">+ Add</button>
+    </div>
+    <div id="options-body" class="opt-cards"></div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Alerts</h2>
+      <button class="btn-ghost" id="add-alert">+ Add</button>
+    </div>
+    <table>
+      <thead><tr><th>Ticker</th><th>Condition</th><th></th></tr></thead>
+      <tbody id="alerts-body"></tbody>
+    </table>
+  </section>
+
+  <div id="modal-root"></div>
+
+  <footer>
+    <p>Positions and alerts are stored only in this browser (localStorage) —
+       never sent anywhere except to fetch prices, and never committed to
+       this public repo.</p>
+  </footer>
+
+<script src="app.js"></script>
+</body>
+</html>
