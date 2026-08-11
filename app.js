@@ -484,6 +484,174 @@ document.getElementById("chart-search-form").onsubmit = (e) => {
 };
 
 // ============================================================================
+// TREND TRACKER — technical indicators computed from price history.
+// Informational signals only, not financial advice or a recommendation.
+// ============================================================================
+function seriesEMA(values, period) {
+  const k = 2 / (period + 1);
+  const out = [];
+  let ema;
+  values.forEach((v, i) => {
+    ema = i === 0 ? v : v * k + ema * (1 - k);
+    out.push(ema);
+  });
+  return out;
+}
+
+function latestRSI(closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) avgGain += diff; else avgLoss -= diff;
+  }
+  avgGain /= period; avgLoss /= period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    avgGain = (avgGain * (period - 1) + Math.max(diff, 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + Math.max(-diff, 0)) / period;
+  }
+  if (avgLoss === 0) return 100;
+  return 100 - 100 / (1 + avgGain / avgLoss);
+}
+
+function latestMACD(closes) {
+  if (closes.length < 35) return null;
+  const ema12 = seriesEMA(closes, 12);
+  const ema26 = seriesEMA(closes, 26);
+  const macdLine = closes.map((_, i) => ema12[i] - ema26[i]);
+  const signalLine = seriesEMA(macdLine, 9);
+  const hist = macdLine.map((v, i) => v - signalLine[i]);
+  const last = hist.length - 1;
+  return { macd: macdLine[last], signal: signalLine[last], hist: hist[last], prevHist: hist[last - 1] };
+}
+
+function smaAt(closes, period, endIndexExclusive) {
+  if (endIndexExclusive < period) return null;
+  const slice = closes.slice(endIndexExclusive - period, endIndexExclusive);
+  return slice.reduce((a, b) => a + b, 0) / period;
+}
+
+// Combines trend (price vs. 50-day average + its slope), momentum (RSI),
+// and MACD into a single read. `continuationWarning` fires only when
+// several bearish signals line up AND RSI isn't already deeply oversold
+// (extreme oversold often precedes a bounce, not more downside).
+function analyzeTrend(bars) {
+  const closes = bars.map(b => b.c);
+  if (closes.length < 30) return null;
+
+  const price = closes[closes.length - 1];
+  const sma50 = smaAt(closes, Math.min(50, closes.length), closes.length);
+  const sma50Prev = closes.length >= 60 ? smaAt(closes, Math.min(50, closes.length - 10), closes.length - 10) : null;
+  const rsi = latestRSI(closes, 14);
+  const macd = latestMACD(closes);
+
+  const recentLow = Math.min(...bars.slice(-10).map(b => b.l));
+  const priorLow = bars.length >= 20 ? Math.min(...bars.slice(-20, -10).map(b => b.l)) : null;
+  const makingLowerLows = priorLow != null && recentLow < priorLow;
+
+  let bearish = 0, bullish = 0;
+  const reasons = [];
+
+  if (sma50 != null) {
+    if (price < sma50) { bearish++; reasons.push("Below 50-day average"); }
+    else { bullish++; reasons.push("Above 50-day average"); }
+  }
+  if (sma50Prev != null && sma50 != null) {
+    if (sma50 < sma50Prev) { bearish++; reasons.push("50-day average declining"); }
+    else { bullish++; }
+  }
+  if (macd) {
+    if (macd.hist < 0) {
+      bearish += macd.hist < macd.prevHist ? 1 : 0.5;
+      reasons.push(macd.hist < macd.prevHist ? "MACD bearish & widening" : "MACD below signal line");
+    } else {
+      bullish++;
+    }
+  }
+  if (rsi != null) {
+    if (rsi < 30) reasons.push(`RSI ${rsi.toFixed(0)} — oversold (reversal risk)`);
+    else if (rsi < 45) { bearish++; reasons.push(`RSI ${rsi.toFixed(0)} — weak momentum`); }
+    else if (rsi > 55) { bullish++; }
+  }
+  if (makingLowerLows) { bearish++; reasons.push("Making lower lows"); }
+
+  let trend = "Sideways";
+  if (bearish >= 3) trend = "Downtrend";
+  else if (bullish >= 3) trend = "Uptrend";
+
+  const deeplyOversold = rsi != null && rsi < 25;
+  const continuationWarning = trend === "Downtrend" && bearish >= 3.5 && !deeplyOversold;
+
+  return { trend, bearish, bullish, reasons, rsi, macd, continuationWarning };
+}
+
+async function fetchDailyBars(symbol, lookbackDays = 220) {
+  const start = new Date(Date.now() - lookbackDays * 86400000).toISOString().slice(0, 10);
+  const res = await fetch(`${WORKER_URL}/api/bars?symbol=${encodeURIComponent(symbol)}&timeframe=1Day&limit=250&start=${start}`);
+  if (!res.ok) throw new Error(`bars fetch failed: ${res.status}`);
+  const data = await res.json();
+  return data.bars || [];
+}
+
+let trendCache = {};
+
+async function updateTrends() {
+  const symbols = allKnownTickers();
+  const entries = await Promise.all(symbols.map(async sym => {
+    try { return [sym, analyzeTrend(await fetchDailyBars(sym))]; }
+    catch (e) { console.warn(`trend fetch failed for ${sym}:`, e); return [sym, null]; }
+  }));
+  trendCache = Object.fromEntries(entries);
+  renderTrends();
+}
+
+function trendRank(t) {
+  if (t.continuationWarning) return 0;
+  if (t.trend === "Downtrend") return 1;
+  if (t.trend === "Sideways") return 2;
+  return 3;
+}
+
+function renderTrends() {
+  const body = document.getElementById("trends-body");
+  const rows = Object.entries(trendCache)
+    .filter(([, t]) => t)
+    .sort((a, b) => trendRank(a[1]) - trendRank(b[1]));
+
+  if (!rows.length) {
+    body.innerHTML = `<p class="muted">Tracking trends — need a bit more price history to compute signals.</p>`;
+    return;
+  }
+
+  body.innerHTML = rows.map(([sym, t]) => {
+    const badgeClass = t.trend === "Downtrend" ? "loss" : t.trend === "Uptrend" ? "gain" : "muted";
+    const macdLabel = t.macd ? (t.macd.hist < 0 ? "Bearish" : "Bullish") : "—";
+    const macdClass = t.macd ? (t.macd.hist < 0 ? "loss" : "gain") : "muted";
+    return `<div class="trend-item ${t.continuationWarning ? "warn" : ""}">
+      <div class="trend-head">
+        <span class="tk">${escapeHtml(sym)}</span>
+        <span class="trend-badge ${badgeClass}">${t.trend}</span>
+      </div>
+      <div class="trend-meta">
+        <span>RSI <strong class="mono">${t.rsi != null ? t.rsi.toFixed(0) : "—"}</strong></span>
+        <span>MACD <strong class="mono ${macdClass}">${macdLabel}</strong></span>
+      </div>
+      <div class="trend-reasons">${t.reasons.map(r => `<span class="news-tag">${escapeHtml(r)}</span>`).join("")}</div>
+      ${t.continuationWarning ? `<div class="trend-warn">&#9650; Signals suggest the downtrend may continue — a technical read, not a recommendation to sell.</div>` : ""}
+    </div>`;
+  }).join("");
+  document.getElementById("trends-stamp").textContent = `Updated ${new Date().toLocaleTimeString()}`;
+}
+
+let lastTrendFetch = 0;
+async function maybeUpdateTrends() {
+  if (lastTrendFetch !== 0 && Date.now() - lastTrendFetch < 5 * 60000) return; // recompute at most every 5 min
+  lastTrendFetch = Date.now();
+  try { await updateTrends(); } catch (e) { console.warn("trend update failed:", e); }
+}
+
+// ============================================================================
 // NEWS
 // ============================================================================
 function escapeHtml(str) {
@@ -583,6 +751,7 @@ async function refresh() {
     renderMaToggles();
     if (chartSymbol) loadChart();
     maybeLoadNews();
+    maybeUpdateTrends();
 
     const total = stockPnl + optionPnl;
     const totalEl = document.getElementById("total-pnl");

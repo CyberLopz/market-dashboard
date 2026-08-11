@@ -25,6 +25,11 @@ JavaScript source.
 - Nothing here is financial advice. This is a read-only monitoring tool —
   you still make every trade decision and every trade yourself, in your
   broker's app.
+- **Trend signals** (the "Trend signals" card): algorithmic technical-analysis
+  output — trend vs. the 50-day moving average, RSI, and MACD, computed
+  client-side from price history and recomputed every few minutes. These are
+  pattern reads on momentum, not predictions, and not personalized
+  recommendations to buy, hold, or sell anything.
 
 ## Setup
 
