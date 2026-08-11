@@ -39,12 +39,25 @@ async function fetchQuotes(symbols) {
   const res = await fetch(`${WORKER_URL}/api/quotes?symbols=${encodeURIComponent(symbols.join(","))}`);
   if (!res.ok) throw new Error(`quotes fetch failed: ${res.status}`);
   const data = await res.json();
+  const snapshots = data.snapshots || data; // tolerate either response shape
   const out = {};
-  for (const [sym, q] of Object.entries(data.quotes || {})) {
+  for (const [sym, snap] of Object.entries(snapshots || {})) {
+    if (!snap) continue;
+    const q = snap.latestQuote || {};
     const bid = parseFloat(q.bp || 0), ask = parseFloat(q.ap || 0);
-    out[sym] = { price: bid && ask ? (bid + ask) / 2 : (ask || bid), bid, ask };
+    const trade = snap.latestTrade && snap.latestTrade.p ? parseFloat(snap.latestTrade.p) : 0;
+    const price = bid && ask ? (bid + ask) / 2 : (ask || bid || trade);
+    const prevClose = snap.prevDailyBar && snap.prevDailyBar.c != null ? parseFloat(snap.prevDailyBar.c) : null;
+    out[sym] = { price, bid, ask, prevClose };
   }
   return out;
+}
+
+async function fetchBars(symbol, timeframe = "1Day", limit = 180) {
+  const res = await fetch(`${WORKER_URL}/api/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&limit=${limit}`);
+  if (!res.ok) throw new Error(`bars fetch failed: ${res.status}`);
+  const data = await res.json();
+  return data.bars || [];
 }
 
 function occSymbol(ticker, expiry, strike, type) {
@@ -82,12 +95,39 @@ function renderWatchlist(quotes) {
   body.innerHTML = state.watchlist.map(t => {
     const q = quotes[t];
     if (!q) return `<tr><td class="tk">${t}</td><td class="num muted" colspan="2">no data</td></tr>`;
+    const chg = q.prevClose ? q.price - q.prevClose : 0;
+    const pct = q.prevClose ? (chg / q.prevClose) * 100 : 0;
     return `<tr>
       <td class="tk">${t}</td>
       <td class="num">${money(q.price)}</td>
-      <td class="num ${pnlClass(q.price - (q.prevClose ?? q.price))}">bid ${money(q.bid)} / ask ${money(q.ask)}</td>
+      <td class="num ${pnlClass(chg)}">${chg >= 0 ? "+" : ""}${chg.toFixed(2)} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)</td>
     </tr>`;
   }).join("");
+}
+
+function allKnownTickers() {
+  return [...new Set([...state.watchlist, ...state.stocks.map(s => s.ticker)])];
+}
+
+function renderTickerTape(quotes) {
+  const track = document.getElementById("ticker-track");
+  const symbols = allKnownTickers();
+  if (!symbols.length) { track.innerHTML = ""; return; }
+  const items = symbols.map(sym => {
+    const q = quotes[sym];
+    if (!q) return `<span class="ticker-item"><span class="tk">${sym}</span><span class="muted">—</span></span>`;
+    const chg = q.prevClose ? q.price - q.prevClose : 0;
+    const pct = q.prevClose ? (chg / q.prevClose) * 100 : 0;
+    const cls = pnlClass(chg);
+    const arrow = chg > 0 ? "&#9650;" : chg < 0 ? "&#9660;" : "&#8226;";
+    return `<span class="ticker-item">
+      <span class="tk">${sym}</span>
+      <span>${money(q.price)}</span>
+      <span class="${cls}"><span class="arrow">${arrow}</span> ${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%</span>
+    </span>`;
+  }).join("");
+  // duplicated once so the marquee loop (translateX -50%) is seamless
+  track.innerHTML = items + items;
 }
 
 function renderStocks(quotes) {
@@ -181,6 +221,71 @@ function bindRemoveButtons() {
 }
 
 // ============================================================================
+// CANDLESTICK CHART
+// ============================================================================
+let chart, candleSeries, volumeSeries, chartSymbol = null;
+
+function ensureChart() {
+  if (chart || typeof LightweightCharts === "undefined") return;
+  const el = document.getElementById("chart-container");
+  chart = LightweightCharts.createChart(el, {
+    layout: { background: { color: "transparent" }, textColor: "#8b96ad", fontFamily: "'JetBrains Mono', Consolas, monospace" },
+    grid: {
+      vertLines: { color: "rgba(37, 49, 80, 0.5)" },
+      horzLines: { color: "rgba(37, 49, 80, 0.5)" },
+    },
+    rightPriceScale: { borderColor: "#253150" },
+    timeScale: { borderColor: "#253150" },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    autoSize: true,
+  });
+  candleSeries = chart.addCandlestickSeries({
+    upColor: "#3ecfb2", downColor: "#ff7a6e",
+    borderUpColor: "#3ecfb2", borderDownColor: "#ff7a6e",
+    wickUpColor: "#3ecfb2", wickDownColor: "#ff7a6e",
+  });
+  volumeSeries = chart.addHistogramSeries({
+    priceFormat: { type: "volume" },
+    priceScaleId: "",
+    color: "#253150",
+  });
+  volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+}
+
+async function renderChart(symbol) {
+  ensureChart();
+  if (!chart) return; // Lightweight Charts failed to load (e.g. offline)
+  try {
+    const bars = await fetchBars(symbol);
+    const candles = bars.map(b => ({ time: b.t.slice(0, 10), open: b.o, high: b.h, low: b.l, close: b.c }));
+    const volumes = bars.map(b => ({
+      time: b.t.slice(0, 10), value: b.v,
+      color: b.c >= b.o ? "rgba(62, 207, 178, 0.5)" : "rgba(255, 122, 110, 0.5)",
+    }));
+    candleSeries.setData(candles);
+    volumeSeries.setData(volumes);
+    chart.timeScale().fitContent();
+  } catch (e) {
+    console.warn(`chart data failed for ${symbol}:`, e);
+  }
+}
+
+function renderChartSymbolPicker() {
+  const wrap = document.getElementById("chart-symbols");
+  const symbols = allKnownTickers();
+  if (!symbols.length) { wrap.innerHTML = ""; return; }
+  if (!chartSymbol || !symbols.includes(chartSymbol)) chartSymbol = symbols[0];
+  wrap.innerHTML = symbols.map(s =>
+    `<button class="chip ${s === chartSymbol ? "active" : ""}" data-sym="${s}">${s}</button>`
+  ).join("");
+  wrap.querySelectorAll("[data-sym]").forEach(btn => btn.onclick = () => {
+    chartSymbol = btn.dataset.sym;
+    renderChartSymbolPicker();
+    renderChart(chartSymbol);
+  });
+}
+
+// ============================================================================
 // MAIN REFRESH LOOP
 // ============================================================================
 async function refresh() {
@@ -206,10 +311,13 @@ async function refresh() {
     }
 
     renderWatchlist(quotes);
+    renderTickerTape(quotes);
     const stockPnl = renderStocks(quotes);
     const optionPnl = renderOptions(quotes, optionMarks);
     renderAlerts(quotes);
     bindRemoveButtons();
+    renderChartSymbolPicker();
+    if (chartSymbol) renderChart(chartSymbol);
 
     const total = stockPnl + optionPnl;
     const totalEl = document.getElementById("total-pnl");

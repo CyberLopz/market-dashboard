@@ -7,12 +7,15 @@
  * two read-only endpoints to your dashboard's frontend:
  *
  *   GET /api/quotes?symbols=AAPL,NVDA,SPY
- *     -> latest real-time (IEX feed) stock quotes
+ *     -> latest real-time (IEX feed) stock snapshots: bid/ask + previous close
  *
  *   GET /api/options?symbol=AAPL&expiration=2026-09-18
  *     -> near-the-money option chain snapshot for that expiry
  *        (free tier = "indicative" feed, not true real-time OPRA —
  *        see README for what that means)
+ *
+ *   GET /api/bars?symbol=AAPL&timeframe=1Day&limit=180
+ *     -> historical OHLCV bars for the candlestick chart
  *
  * SECURITY NOTES:
  *   - Set ALPACA_KEY_ID / ALPACA_SECRET_KEY as Worker secrets
@@ -56,7 +59,28 @@ async function handleQuotes(url, env) {
   if (!symbols) {
     return new Response(JSON.stringify({ error: "missing symbols param" }), { status: 400 });
   }
-  const data = await alpacaFetch(env, `/v2/stocks/quotes/latest?symbols=${encodeURIComponent(symbols)}&feed=iex`);
+  // Snapshots give bid/ask AND previous close in one call (quotes/latest gives only bid/ask).
+  const data = await alpacaFetch(env, `/v2/stocks/snapshots?symbols=${encodeURIComponent(symbols)}&feed=iex`);
+  return new Response(JSON.stringify(data), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+async function handleBars(url, env) {
+  const symbol = url.searchParams.get("symbol");
+  const timeframe = url.searchParams.get("timeframe") || "1Day";
+  const limit = parseInt(url.searchParams.get("limit") || "180", 10);
+  if (!symbol) {
+    return new Response(JSON.stringify({ error: "missing symbol param" }), { status: 400 });
+  }
+  // Alpaca defaults `start` to "now" when omitted, which starves a daily-bar
+  // request down to ~1 result — compute an explicit lookback window instead.
+  const lookbackDays = Math.ceil(limit * 1.6) + 5; // pad for weekends/holidays
+  const start = new Date(Date.now() - lookbackDays * 86400000).toISOString().slice(0, 10);
+  const path = `/v2/stocks/${encodeURIComponent(symbol)}/bars`
+    + `?timeframe=${encodeURIComponent(timeframe)}&limit=${limit}&start=${start}`
+    + `&feed=iex&adjustment=raw&sort=asc`;
+  const data = await alpacaFetch(env, path);
   return new Response(JSON.stringify(data), {
     headers: { "Content-Type": "application/json" },
   });
@@ -91,6 +115,8 @@ export default {
         response = await handleQuotes(url, env);
       } else if (url.pathname === "/api/options") {
         response = await handleOptions(url, env);
+      } else if (url.pathname === "/api/bars") {
+        response = await handleBars(url, env);
       } else {
         response = new Response(JSON.stringify({ error: "not found" }), { status: 404 });
       }
