@@ -74,9 +74,13 @@ async function handleBars(url, env) {
     return new Response(JSON.stringify({ error: "missing symbol param" }), { status: 400 });
   }
   // Alpaca defaults `start` to "now" when omitted, which starves a daily-bar
-  // request down to ~1 result — compute an explicit lookback window instead.
-  const lookbackDays = Math.ceil(limit * 1.6) + 5; // pad for weekends/holidays
-  const start = new Date(Date.now() - lookbackDays * 86400000).toISOString().slice(0, 10);
+  // request down to ~1 result — honor an explicit start from the caller
+  // (it knows the intended range), else fall back to a limit-based heuristic.
+  let start = url.searchParams.get("start");
+  if (!start) {
+    const lookbackDays = Math.ceil(limit * 1.6) + 5; // pad for weekends/holidays
+    start = new Date(Date.now() - lookbackDays * 86400000).toISOString().slice(0, 10);
+  }
   const path = `/v2/stocks/${encodeURIComponent(symbol)}/bars`
     + `?timeframe=${encodeURIComponent(timeframe)}&limit=${limit}&start=${start}`
     + `&feed=iex&adjustment=raw&sort=asc`;

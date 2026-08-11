@@ -37,9 +37,26 @@
     <section class="card">
       <div class="section-head">
         <h2>Chart</h2>
-        <div class="chart-symbols" id="chart-symbols"></div>
+        <form id="chart-search-form" class="chart-search">
+          <input id="chart-search-input" type="text" placeholder="Search any symbol…" autocomplete="off" maxlength="8">
+        </form>
       </div>
-      <div id="chart-container" class="chart-container"></div>
+
+      <div class="chart-toolbar">
+        <div class="chart-symbols" id="chart-symbols"></div>
+        <div class="chart-toolbar-right">
+          <div class="seg" id="chart-ranges"></div>
+          <div class="seg" id="chart-types"></div>
+          <div class="seg" id="chart-mas"></div>
+        </div>
+      </div>
+
+      <div class="chart-stats" id="chart-stats"></div>
+
+      <div class="chart-wrap">
+        <div class="chart-legend" id="chart-legend"></div>
+        <div id="chart-container" class="chart-container"></div>
+      </div>
     </section>
 
     <div class="grid-2">

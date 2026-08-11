@@ -53,13 +53,6 @@ async function fetchQuotes(symbols) {
   return out;
 }
 
-async function fetchBars(symbol, timeframe = "1Day", limit = 180) {
-  const res = await fetch(`${WORKER_URL}/api/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&limit=${limit}`);
-  if (!res.ok) throw new Error(`bars fetch failed: ${res.status}`);
-  const data = await res.json();
-  return data.bars || [];
-}
-
 function occSymbol(ticker, expiry, strike, type) {
   const [y, m, d] = expiry.split("-");
   const yy = y.slice(2);
@@ -223,7 +216,73 @@ function bindRemoveButtons() {
 // ============================================================================
 // CANDLESTICK CHART
 // ============================================================================
-let chart, candleSeries, volumeSeries, chartSymbol = null;
+const CHART_RANGES = [
+  { id: "1D", label: "1D", timeframe: "5Min", lookbackDays: 6, intraday: true, singleSession: true },
+  { id: "1W", label: "1W", timeframe: "15Min", lookbackDays: 9, intraday: true },
+  { id: "1M", label: "1M", timeframe: "1Day", lookbackDays: 35 },
+  { id: "3M", label: "3M", timeframe: "1Day", lookbackDays: 100 },
+  { id: "6M", label: "6M", timeframe: "1Day", lookbackDays: 200 },
+  { id: "YTD", label: "YTD", timeframe: "1Day", ytd: true },
+  { id: "1Y", label: "1Y", timeframe: "1Day", lookbackDays: 370 },
+  { id: "5Y", label: "5Y", timeframe: "1Week", lookbackDays: 1830 },
+];
+const CHART_TYPES = [
+  { id: "candle", label: "Candles" },
+  { id: "line", label: "Line" },
+  { id: "area", label: "Area" },
+];
+const MA_PERIODS = [
+  { period: 20, color: "#f4b860" },
+  { period: 50, color: "#6d8bff" },
+  { period: 200, color: "#ff7a6e" },
+];
+
+let chart, priceSeries, volumeSeries;
+let chartSymbol = null;
+let chartRangeId = "6M";
+let chartType = "candle";
+let maEnabled = { 20: false, 50: false, 200: false };
+let maSeriesMap = {};
+let currentBars = [];
+let currentRange = null;
+
+function toChartTime(iso, range) {
+  return range && range.intraday ? Math.floor(new Date(iso).getTime() / 1000) : iso.slice(0, 10);
+}
+
+async function fetchBars(symbol, range) {
+  const limit = range.intraday ? 1000 : 500;
+  const start = range.ytd
+    ? `${new Date().getFullYear()}-01-01`
+    : new Date(Date.now() - range.lookbackDays * 86400000).toISOString().slice(0, 10);
+  const res = await fetch(`${WORKER_URL}/api/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${range.timeframe}&limit=${limit}&start=${start}`);
+  if (!res.ok) throw new Error(`bars fetch failed: ${res.status}`);
+  const data = await res.json();
+  let bars = data.bars || [];
+  if (range.singleSession && bars.length) {
+    const lastDay = bars[bars.length - 1].t.slice(0, 10);
+    bars = bars.filter(b => b.t.slice(0, 10) === lastDay);
+  }
+  return bars;
+}
+
+function createPriceSeries() {
+  if (priceSeries) { chart.removeSeries(priceSeries); priceSeries = null; }
+  if (chartType === "line") {
+    priceSeries = chart.addLineSeries({ color: "#6d8bff", lineWidth: 2 });
+  } else if (chartType === "area") {
+    priceSeries = chart.addAreaSeries({
+      lineColor: "#6d8bff", lineWidth: 2,
+      topColor: "rgba(109, 139, 255, 0.35)", bottomColor: "rgba(109, 139, 255, 0.02)",
+    });
+  } else {
+    priceSeries = chart.addCandlestickSeries({
+      upColor: "#3ecfb2", downColor: "#ff7a6e",
+      borderUpColor: "#3ecfb2", borderDownColor: "#ff7a6e",
+      wickUpColor: "#3ecfb2", wickDownColor: "#ff7a6e",
+    });
+  }
+}
 
 function ensureChart() {
   if (chart || typeof LightweightCharts === "undefined") return;
@@ -239,51 +298,190 @@ function ensureChart() {
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     autoSize: true,
   });
-  candleSeries = chart.addCandlestickSeries({
-    upColor: "#3ecfb2", downColor: "#ff7a6e",
-    borderUpColor: "#3ecfb2", borderDownColor: "#ff7a6e",
-    wickUpColor: "#3ecfb2", wickDownColor: "#ff7a6e",
-  });
+  createPriceSeries();
   volumeSeries = chart.addHistogramSeries({
     priceFormat: { type: "volume" },
     priceScaleId: "",
     color: "#253150",
   });
   volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  chart.subscribeCrosshairMove(param => {
+    if (!currentBars.length) return;
+    if (!param || !param.time) { updateLegend(currentBars[currentBars.length - 1]); return; }
+    const match = currentBars.find(b => toChartTime(b.t, currentRange) === param.time);
+    updateLegend(match || currentBars[currentBars.length - 1]);
+  });
 }
 
-async function renderChart(symbol) {
-  ensureChart();
-  if (!chart) return; // Lightweight Charts failed to load (e.g. offline)
-  try {
-    const bars = await fetchBars(symbol);
-    const candles = bars.map(b => ({ time: b.t.slice(0, 10), open: b.o, high: b.h, low: b.l, close: b.c }));
-    const volumes = bars.map(b => ({
-      time: b.t.slice(0, 10), value: b.v,
-      color: b.c >= b.o ? "rgba(62, 207, 178, 0.5)" : "rgba(255, 122, 110, 0.5)",
-    }));
-    candleSeries.setData(candles);
-    volumeSeries.setData(volumes);
-    chart.timeScale().fitContent();
-  } catch (e) {
-    console.warn(`chart data failed for ${symbol}:`, e);
+function computeSMA(bars, period) {
+  if (bars.length < period) return [];
+  const out = [];
+  let sum = 0;
+  for (let i = 0; i < bars.length; i++) {
+    sum += bars[i].c;
+    if (i >= period) sum -= bars[i - period].c;
+    if (i >= period - 1) out.push({ time: toChartTime(bars[i].t, currentRange), value: sum / period });
   }
+  return out;
+}
+
+function updateMAs() {
+  MA_PERIODS.forEach(m => {
+    const key = m.period;
+    const shouldShow = maEnabled[key] && currentBars.length >= key;
+    if (shouldShow) {
+      if (!maSeriesMap[key]) {
+        maSeriesMap[key] = chart.addLineSeries({
+          color: m.color, lineWidth: 1,
+          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        });
+      }
+      maSeriesMap[key].applyOptions({ visible: true });
+      maSeriesMap[key].setData(computeSMA(currentBars, key));
+    } else if (maSeriesMap[key]) {
+      maSeriesMap[key].applyOptions({ visible: false });
+    }
+  });
+}
+
+let refLines = [];
+function updateReferenceLines() {
+  refLines.forEach(pl => { try { priceSeries.removePriceLine(pl); } catch { /* series was swapped */ } });
+  refLines = [];
+  const pos = state.stocks.find(s => s.ticker === chartSymbol);
+  if (pos) {
+    refLines.push(priceSeries.createPriceLine({
+      price: pos.costBasis, color: "#f4b860", lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: "cost basis",
+    }));
+  }
+  state.alerts.filter(a => a.ticker === chartSymbol).forEach(a => {
+    refLines.push(priceSeries.createPriceLine({
+      price: a.level, color: "#8b96ad", lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: `alert ${a.direction}`,
+    }));
+  });
+}
+
+function updateStatsBar() {
+  const el = document.getElementById("chart-stats");
+  if (!currentBars.length) { el.innerHTML = ""; return; }
+  const rangeHigh = Math.max(...currentBars.map(b => b.h));
+  const rangeLow = Math.min(...currentBars.map(b => b.l));
+  const first = currentBars[0].o, last = currentBars[currentBars.length - 1].c;
+  const chg = last - first, pct = first ? (chg / first) * 100 : 0;
+  el.innerHTML = `
+    <span>Range <strong class="mono">${money(rangeLow)}–${money(rangeHigh)}</strong></span>
+    <span>Period <strong class="mono ${pnlClass(chg)}">${chg >= 0 ? "+" : ""}${money(chg)} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)</strong></span>`;
+}
+
+function updateLegend(bar) {
+  const el = document.getElementById("chart-legend");
+  if (!bar) { el.innerHTML = ""; return; }
+  el.innerHTML = `<span class="tk">${chartSymbol}</span>
+    <span>O <strong class="mono">${money(bar.o)}</strong></span>
+    <span>H <strong class="mono">${money(bar.h)}</strong></span>
+    <span>L <strong class="mono">${money(bar.l)}</strong></span>
+    <span>C <strong class="mono ${pnlClass(bar.c - bar.o)}">${money(bar.c)}</strong></span>
+    <span>Vol <strong class="mono">${Number(bar.v).toLocaleString()}</strong></span>`;
+}
+
+function drawChart() {
+  if (!chart || !currentRange) return;
+  chart.applyOptions({ timeScale: { timeVisible: !!currentRange.intraday, borderColor: "#253150" } });
+  if (chartType === "candle") {
+    priceSeries.setData(currentBars.map(b => ({ time: toChartTime(b.t, currentRange), open: b.o, high: b.h, low: b.l, close: b.c })));
+  } else {
+    priceSeries.setData(currentBars.map(b => ({ time: toChartTime(b.t, currentRange), value: b.c })));
+  }
+  volumeSeries.setData(currentBars.map(b => ({
+    time: toChartTime(b.t, currentRange), value: b.v,
+    color: b.c >= b.o ? "rgba(62, 207, 178, 0.5)" : "rgba(255, 122, 110, 0.5)",
+  })));
+  updateMAs();
+  updateReferenceLines();
+  updateStatsBar();
+  updateLegend(currentBars[currentBars.length - 1]);
+  chart.timeScale().fitContent();
+}
+
+async function loadChart() {
+  ensureChart();
+  if (!chart || !chartSymbol) return;
+  currentRange = CHART_RANGES.find(r => r.id === chartRangeId) || CHART_RANGES[4];
+  try {
+    currentBars = await fetchBars(chartSymbol, currentRange);
+  } catch (e) {
+    console.warn(`chart data failed for ${chartSymbol}:`, e);
+    currentBars = [];
+  }
+  drawChart();
+}
+
+function selectChartSymbol(sym) {
+  chartSymbol = sym.trim().toUpperCase();
+  renderChartSymbolPicker();
+  loadChart();
 }
 
 function renderChartSymbolPicker() {
   const wrap = document.getElementById("chart-symbols");
-  const symbols = allKnownTickers();
+  let symbols = allKnownTickers();
+  if (!chartSymbol) chartSymbol = symbols[0] || null;
+  if (chartSymbol && !symbols.includes(chartSymbol)) symbols = [...symbols, chartSymbol];
   if (!symbols.length) { wrap.innerHTML = ""; return; }
-  if (!chartSymbol || !symbols.includes(chartSymbol)) chartSymbol = symbols[0];
   wrap.innerHTML = symbols.map(s =>
     `<button class="chip ${s === chartSymbol ? "active" : ""}" data-sym="${s}">${s}</button>`
   ).join("");
-  wrap.querySelectorAll("[data-sym]").forEach(btn => btn.onclick = () => {
-    chartSymbol = btn.dataset.sym;
-    renderChartSymbolPicker();
-    renderChart(chartSymbol);
+  wrap.querySelectorAll("[data-sym]").forEach(btn => btn.onclick = () => selectChartSymbol(btn.dataset.sym));
+}
+
+function renderRangeSelector() {
+  const wrap = document.getElementById("chart-ranges");
+  wrap.innerHTML = CHART_RANGES.map(r =>
+    `<button data-range="${r.id}" class="${r.id === chartRangeId ? "active" : ""}">${r.label}</button>`
+  ).join("");
+  wrap.querySelectorAll("[data-range]").forEach(btn => btn.onclick = () => {
+    chartRangeId = btn.dataset.range;
+    renderRangeSelector();
+    loadChart();
   });
 }
+
+function renderTypeSelector() {
+  const wrap = document.getElementById("chart-types");
+  wrap.innerHTML = CHART_TYPES.map(t =>
+    `<button data-type="${t.id}" class="${t.id === chartType ? "active" : ""}">${t.label}</button>`
+  ).join("");
+  wrap.querySelectorAll("[data-type]").forEach(btn => btn.onclick = () => {
+    chartType = btn.dataset.type;
+    renderTypeSelector();
+    createPriceSeries();
+    drawChart();
+  });
+}
+
+function renderMaToggles() {
+  const wrap = document.getElementById("chart-mas");
+  wrap.innerHTML = MA_PERIODS.map(m =>
+    `<button data-ma="${m.period}" class="ma-toggle ${maEnabled[m.period] ? "active" : ""}" style="--ma-color:${m.color}">MA${m.period}</button>`
+  ).join("");
+  wrap.querySelectorAll("[data-ma]").forEach(btn => btn.onclick = () => {
+    const p = btn.dataset.ma;
+    maEnabled[p] = !maEnabled[p];
+    renderMaToggles();
+    updateMAs();
+  });
+}
+
+document.getElementById("chart-search-form").onsubmit = (e) => {
+  e.preventDefault();
+  const input = document.getElementById("chart-search-input");
+  const sym = input.value.trim();
+  if (!sym) return;
+  input.value = "";
+  selectChartSymbol(sym);
+};
 
 // ============================================================================
 // MAIN REFRESH LOOP
@@ -317,7 +515,10 @@ async function refresh() {
     renderAlerts(quotes);
     bindRemoveButtons();
     renderChartSymbolPicker();
-    if (chartSymbol) renderChart(chartSymbol);
+    renderRangeSelector();
+    renderTypeSelector();
+    renderMaToggles();
+    if (chartSymbol) loadChart();
 
     const total = stockPnl + optionPnl;
     const totalEl = document.getElementById("total-pnl");
