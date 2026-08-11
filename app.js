@@ -21,7 +21,12 @@ let state = {
   watchlist: store.get("md_watchlist", ["AAPL", "NVDA", "SPY", "TSLA", "AMD"]),
   stocks: store.get("md_stocks", []),       // {ticker, shares, costBasis}
   options: store.get("md_options", []),     // {ticker, expiry, strike, type, contracts, premium}
-  alerts: store.get("md_alerts", []),       // {ticker, direction, level}
+  // {type: "price", ticker, direction, level}
+  // {type: "volume", ticker, multiple}
+  // {type: "iv", optionKey, label, thresholdPts, ivBaseline}
+  // {type: "dte", optionKey, label, thresholdDays}
+  // migration: legacy entries predate `type` — they're always price alerts.
+  alerts: store.get("md_alerts", []).map(a => ({ type: "price", ...a })),
 };
 
 function persist() {
@@ -48,7 +53,12 @@ async function fetchQuotes(symbols) {
     const trade = snap.latestTrade && snap.latestTrade.p ? parseFloat(snap.latestTrade.p) : 0;
     const price = bid && ask ? (bid + ask) / 2 : (ask || bid || trade);
     const prevClose = snap.prevDailyBar && snap.prevDailyBar.c != null ? parseFloat(snap.prevDailyBar.c) : null;
-    out[sym] = { price, bid, ask, prevClose };
+    // Cumulative volume for *today so far* — partial during market hours, so a
+    // volume-spike check against a full prior-day average under-fires early in
+    // the session and is most meaningful later in the day. That's an inherent
+    // property of comparing a running total to a historical average, not a bug.
+    const todayVolume = snap.dailyBar && snap.dailyBar.v != null ? snap.dailyBar.v : null;
+    out[sym] = { price, bid, ask, prevClose, todayVolume };
   }
   return out;
 }
@@ -59,6 +69,15 @@ function occSymbol(ticker, expiry, strike, type) {
   const cp = type === "call" ? "C" : "P";
   const strikeStr = String(Math.round(strike * 1000)).padStart(8, "0");
   return `${ticker}${yy}${m}${d}${cp}${strikeStr}`;
+}
+
+// Stable identity for an option position — array index shifts when positions
+// are added/removed, so iv/dte alerts reference this instead.
+function optionKeyFor(o) {
+  return `${o.ticker}|${o.expiry}|${o.strike}|${o.type}`;
+}
+function optionLabelFor(o) {
+  return `${o.ticker} $${o.strike} ${o.type.toUpperCase()} ${o.expiry}`;
 }
 
 async function fetchOptionSnapshot(ticker, expiry) {
@@ -74,6 +93,13 @@ function markFromSnapshot(snap) {
   if (q && q.bp && q.ap) return (parseFloat(q.bp) + parseFloat(q.ap)) / 2;
   if (snap.latestTrade && snap.latestTrade.p) return parseFloat(snap.latestTrade.p);
   return 0;
+}
+
+// Alpaca returns impliedVolatility as a fraction (0.2476) — we track/display
+// it in percentage points (24.76) since that's the natural unit for a
+// "moved more than N points" threshold.
+function ivFromSnapshot(snap) {
+  return snap && snap.impliedVolatility != null ? parseFloat(snap.impliedVolatility) * 100 : null;
 }
 
 // ============================================================================
@@ -99,7 +125,10 @@ function renderWatchlist(quotes) {
 }
 
 function allKnownTickers() {
-  return [...new Set([...state.watchlist, ...state.stocks.map(s => s.ticker)])];
+  // price/volume alerts carry a bare `.ticker`; iv/dte alerts carry `.optionKey`
+  // instead, so this naturally excludes them.
+  const alertTickers = state.alerts.filter(a => a.ticker).map(a => a.ticker);
+  return [...new Set([...state.watchlist, ...state.stocks.map(s => s.ticker), ...alertTickers])];
 }
 
 function renderTickerTape(quotes) {
@@ -185,30 +214,96 @@ function renderOptions(quotes, optionMarks) {
   return totalPnl;
 }
 
-function renderAlerts(quotes) {
+function renderAlerts(quotes, optionIVs) {
   const body = document.getElementById("alerts-body");
   const fired = [];
+  let baselinesChanged = false;
+
   body.innerHTML = state.alerts.map((a, i) => {
-    const q = quotes[a.ticker];
-    const isFired = q && ((a.direction === "above" && q.price >= a.level) ||
-                           (a.direction === "below" && q.price <= a.level));
-    if (isFired) fired.push(`${a.ticker} is ${a.direction} ${money(a.level)} — now ${money(q.price)}`);
+    let isFired = false;
+    let label = a.ticker || a.label || a.optionKey || "—";
+    let condText = "";
+
+    if (a.type === "volume") {
+      const q = quotes[a.ticker];
+      const avgVol = trendCache[a.ticker] && trendCache[a.ticker].avgVolume20;
+      condText = `Volume &ge; ${a.multiple}&times; 20d avg`;
+      if (q && q.todayVolume != null && avgVol) {
+        isFired = q.todayVolume >= avgVol * a.multiple;
+        if (isFired) {
+          fired.push(`${a.ticker} volume is ${(q.todayVolume / avgVol).toFixed(1)}&times; its 20-day average`);
+        }
+      } else {
+        condText += ` <span class="muted">(building history…)</span>`;
+      }
+    } else if (a.type === "iv") {
+      const currentIV = optionIVs ? optionIVs[a.optionKey] : null;
+      condText = `IV &Delta; &gt; ${a.thresholdPts}pt`;
+      if (currentIV != null) {
+        if (a.ivBaseline == null) {
+          a.ivBaseline = currentIV; // first observation becomes the baseline
+          baselinesChanged = true;
+        } else {
+          const delta = currentIV - a.ivBaseline;
+          isFired = Math.abs(delta) >= a.thresholdPts;
+          if (isFired) {
+            fired.push(`${label} IV moved ${delta >= 0 ? "+" : ""}${delta.toFixed(1)}pt `
+              + `(${a.ivBaseline.toFixed(1)}% &rarr; ${currentIV.toFixed(1)}%)`);
+          }
+        }
+        condText += ` <span class="muted">(base ${a.ivBaseline != null ? a.ivBaseline.toFixed(1) : "—"}%, now ${currentIV.toFixed(1)}%)</span>`;
+      } else {
+        condText += ` <span class="muted">(no quote yet)</span>`;
+      }
+    } else if (a.type === "dte") {
+      const opt = state.options.find(o => optionKeyFor(o) === a.optionKey);
+      condText = `Warn at &le; ${a.thresholdDays}d`;
+      if (opt) {
+        const dte = Math.max(0, Math.round((new Date(opt.expiry) - new Date()) / 86400000));
+        isFired = dte <= a.thresholdDays;
+        condText += ` <span class="muted">(${dte}d left)</span>`;
+        if (isFired) fired.push(`${label} expires in ${dte}d (&le; ${a.thresholdDays}d threshold)`);
+      } else {
+        condText += ` <span class="muted">(position removed)</span>`;
+      }
+    } else { // "price"
+      const q = quotes[a.ticker];
+      condText = `${a.direction} ${money(a.level)}`;
+      isFired = q && ((a.direction === "above" && q.price >= a.level) || (a.direction === "below" && q.price <= a.level));
+      if (isFired) fired.push(`${a.ticker} is ${a.direction} ${money(a.level)} — now ${money(q.price)}`);
+    }
+
     return `<tr>
-      <td class="tk">${a.ticker}</td>
-      <td class="${isFired ? "warn" : ""}">${a.direction} ${money(a.level)}</td>
+      <td class="tk">${escapeHtml(label)}</td>
+      <td class="${isFired ? "warn" : ""}">${condText}</td>
       <td><button class="btn-remove" data-remove-alert="${i}">&times;</button></td>
     </tr>`;
   }).join("");
+
   document.getElementById("alerts-section").innerHTML = fired.length
     ? fired.map(f => `<div class="alert-item">&#9650; ${f}</div>`).join("")
     : "";
+
+  // IV alerts capture their baseline lazily (see above) — persist it so a
+  // page reload doesn't re-baseline against a different moment.
+  if (baselinesChanged) persist();
 }
 
 function bindRemoveButtons() {
   document.querySelectorAll("[data-remove-stock]").forEach(btn =>
     btn.onclick = () => { state.stocks.splice(+btn.dataset.removeStock, 1); persist(); refresh(); });
   document.querySelectorAll("[data-remove-option]").forEach(btn =>
-    btn.onclick = () => { state.options.splice(+btn.dataset.removeOption, 1); persist(); refresh(); });
+    btn.onclick = () => {
+      const idx = +btn.dataset.removeOption;
+      const removed = state.options[idx];
+      state.options.splice(idx, 1);
+      // iv/dte alerts reference a specific position — drop any left orphaned.
+      if (removed) {
+        const key = optionKeyFor(removed);
+        state.alerts = state.alerts.filter(a => !((a.type === "iv" || a.type === "dte") && a.optionKey === key));
+      }
+      persist(); refresh();
+    });
   document.querySelectorAll("[data-remove-alert]").forEach(btn =>
     btn.onclick = () => { state.alerts.splice(+btn.dataset.removeAlert, 1); persist(); refresh(); });
 }
@@ -583,7 +678,12 @@ function analyzeTrend(bars) {
   const deeplyOversold = rsi != null && rsi < 25;
   const continuationWarning = trend === "Downtrend" && bearish >= 3.5 && !deeplyOversold;
 
-  return { trend, bearish, bullish, reasons, rsi, macd, continuationWarning };
+  // 20-day average volume, for volume-spike alerts — excludes today's bar
+  // (still accumulating intraday, would skew a "typical day" baseline low).
+  const volBars = bars.slice(0, -1).slice(-20);
+  const avgVolume20 = volBars.length ? volBars.reduce((s, b) => s + b.v, 0) / volBars.length : null;
+
+  return { trend, bearish, bullish, reasons, rsi, macd, continuationWarning, avgVolume20 };
 }
 
 async function fetchDailyBars(symbol, lookbackDays = 220) {
@@ -719,15 +819,19 @@ async function maybeLoadNews() {
 // ============================================================================
 async function refresh() {
   try {
+    const alertTickers = state.alerts.filter(a => a.ticker).map(a => a.ticker);
     const allTickers = [...new Set([
       ...state.watchlist,
       ...state.stocks.map(s => s.ticker),
       ...state.options.map(o => o.ticker),
+      ...alertTickers,
     ])];
     const quotes = await fetchQuotes(allTickers);
 
-    // Option marks: fetch each unique (ticker, expiry) chain once, then pull each contract's mark
+    // Option marks + IV: fetch each unique (ticker, expiry) chain once, then
+    // pull each contract's mark/IV out of that shared snapshot.
     const optionMarks = [];
+    const optionIVs = {};
     const chainCache = {};
     for (const o of state.options) {
       const key = `${o.ticker}|${o.expiry}`;
@@ -736,14 +840,16 @@ async function refresh() {
         catch (e) { console.warn(e); chainCache[key] = {}; }
       }
       const sym = occSymbol(o.ticker, o.expiry, o.strike, o.type);
-      optionMarks.push(markFromSnapshot(chainCache[key][sym]));
+      const snap = chainCache[key][sym];
+      optionMarks.push(markFromSnapshot(snap));
+      optionIVs[optionKeyFor(o)] = ivFromSnapshot(snap);
     }
 
     renderWatchlist(quotes);
     renderTickerTape(quotes);
     const stockPnl = renderStocks(quotes);
     const optionPnl = renderOptions(quotes, optionMarks);
-    renderAlerts(quotes);
+    renderAlerts(quotes, optionIVs);
     bindRemoveButtons();
     renderChartSymbolPicker();
     renderRangeSelector();
@@ -768,10 +874,11 @@ async function refresh() {
 // ============================================================================
 // MODALS (add stock / option / alert / edit watchlist)
 // ============================================================================
-function openModal(html, onSubmit) {
+function openModal(html, onSubmit, onRender) {
   const root = document.getElementById("modal-root");
   root.innerHTML = `<div class="modal-backdrop"><div class="modal">${html}</div></div>`;
   root.querySelector(".cancel").onclick = () => (root.innerHTML = "");
+  if (onRender) onRender(root);
   root.querySelector("form").onsubmit = (e) => {
     e.preventDefault();
     onSubmit(new FormData(e.target));
@@ -818,21 +925,85 @@ document.getElementById("add-option").onclick = () => openModal(`
     premium: parseFloat(fd.get("premium")),
   }));
 
-document.getElementById("add-alert").onclick = () => openModal(`
-  <h3>Add alert</h3>
-  <form>
-    <label>Ticker</label><input name="ticker" required style="text-transform:uppercase">
-    <label>Condition</label>
-    <select name="direction"><option value="above">Price above</option><option value="below">Price below</option></select>
-    <label>Level</label><input name="level" type="number" step="any" required>
-    <div class="actions"><button type="button" class="cancel">Cancel</button>
-    <button type="submit" class="primary">Add</button></div>
-  </form>`,
-  (fd) => state.alerts.push({
-    ticker: fd.get("ticker").toUpperCase(),
-    direction: fd.get("direction"),
-    level: parseFloat(fd.get("level")),
-  }));
+document.getElementById("add-alert").onclick = () => {
+  const optionOptions = state.options.length
+    ? state.options.map(o => `<option value="${optionKeyFor(o)}">${optionLabelFor(o)}</option>`).join("")
+    : `<option value="" disabled selected>Add an option position first</option>`;
+
+  openModal(`
+    <h3>Add alert</h3>
+    <form>
+      <label>Alert type</label>
+      <select name="type" id="alert-type-select">
+        <option value="price">Price</option>
+        <option value="volume">Volume spike</option>
+        <option value="iv">Option IV change</option>
+        <option value="dte">Option days-to-expiration</option>
+      </select>
+
+      <div class="alert-fieldset" data-for="price">
+        <label>Ticker</label><input name="ticker" required style="text-transform:uppercase">
+        <label>Condition</label>
+        <select name="direction"><option value="above">Price above</option><option value="below">Price below</option></select>
+        <label>Level</label><input name="level" type="number" step="any" required>
+      </div>
+
+      <div class="alert-fieldset" data-for="volume" hidden>
+        <label>Ticker</label><input name="volTicker" required style="text-transform:uppercase">
+        <label>Surge multiple (current volume &ge; N &times; 20-day average)</label>
+        <input name="multiple" type="number" step="any" value="2" min="1" required>
+      </div>
+
+      <div class="alert-fieldset" data-for="iv" hidden>
+        <label>Option position</label>
+        <select name="optionKeyIv" required>${optionOptions}</select>
+        <label>Alert when IV moves more than this many points (e.g. 5 = 5%)</label>
+        <input name="ivThreshold" type="number" step="any" value="5" min="0" required>
+      </div>
+
+      <div class="alert-fieldset" data-for="dte" hidden>
+        <label>Option position</label>
+        <select name="optionKeyDte" required>${optionOptions}</select>
+        <label>Warn me at N days to expiration</label>
+        <input name="dteThreshold" type="number" step="1" value="7" min="0" required>
+      </div>
+
+      <div class="actions"><button type="button" class="cancel">Cancel</button>
+      <button type="submit" class="primary">Add</button></div>
+    </form>`,
+    (fd) => {
+      const type = fd.get("type");
+      if (type === "volume") {
+        const ticker = (fd.get("volTicker") || "").trim().toUpperCase();
+        const multiple = parseFloat(fd.get("multiple"));
+        if (!ticker || !Number.isFinite(multiple) || multiple <= 0) return;
+        state.alerts.push({ type: "volume", ticker, multiple });
+      } else if (type === "iv") {
+        const optionKey = fd.get("optionKeyIv");
+        const thresholdPts = parseFloat(fd.get("ivThreshold"));
+        const opt = state.options.find(o => optionKeyFor(o) === optionKey);
+        if (!opt || !Number.isFinite(thresholdPts)) return;
+        state.alerts.push({ type: "iv", optionKey, label: optionLabelFor(opt), thresholdPts, ivBaseline: null });
+      } else if (type === "dte") {
+        const optionKey = fd.get("optionKeyDte");
+        const thresholdDays = parseInt(fd.get("dteThreshold"), 10);
+        const opt = state.options.find(o => optionKeyFor(o) === optionKey);
+        if (!opt || !Number.isFinite(thresholdDays)) return;
+        state.alerts.push({ type: "dte", optionKey, label: optionLabelFor(opt), thresholdDays });
+      } else {
+        const ticker = (fd.get("ticker") || "").trim().toUpperCase();
+        const level = parseFloat(fd.get("level"));
+        if (!ticker || !Number.isFinite(level)) return;
+        state.alerts.push({ type: "price", ticker, direction: fd.get("direction"), level });
+      }
+    },
+    (root) => {
+      const select = root.querySelector("#alert-type-select");
+      const groups = root.querySelectorAll(".alert-fieldset");
+      select.onchange = () => groups.forEach(g => { g.hidden = g.dataset.for !== select.value; });
+    }
+  );
+};
 
 document.getElementById("edit-watchlist").onclick = () => openModal(`
   <h3>Edit watchlist</h3>
