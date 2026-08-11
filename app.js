@@ -942,30 +942,30 @@ document.getElementById("add-alert").onclick = () => {
       </select>
 
       <div class="alert-fieldset" data-for="price">
-        <label>Ticker</label><input name="ticker" required style="text-transform:uppercase">
+        <label>Ticker</label><input name="ticker" data-required style="text-transform:uppercase">
         <label>Condition</label>
         <select name="direction"><option value="above">Price above</option><option value="below">Price below</option></select>
-        <label>Level</label><input name="level" type="number" step="any" required>
+        <label>Level</label><input name="level" type="number" step="any" data-required>
       </div>
 
       <div class="alert-fieldset" data-for="volume" hidden>
-        <label>Ticker</label><input name="volTicker" required style="text-transform:uppercase">
+        <label>Ticker</label><input name="volTicker" data-required style="text-transform:uppercase">
         <label>Surge multiple (current volume &ge; N &times; 20-day average)</label>
-        <input name="multiple" type="number" step="any" value="2" min="1" required>
+        <input name="multiple" type="number" step="any" value="2" min="1" data-required>
       </div>
 
       <div class="alert-fieldset" data-for="iv" hidden>
         <label>Option position</label>
-        <select name="optionKeyIv" required>${optionOptions}</select>
+        <select name="optionKeyIv" data-required>${optionOptions}</select>
         <label>Alert when IV moves more than this many points (e.g. 5 = 5%)</label>
-        <input name="ivThreshold" type="number" step="any" value="5" min="0" required>
+        <input name="ivThreshold" type="number" step="any" value="5" min="0" data-required>
       </div>
 
       <div class="alert-fieldset" data-for="dte" hidden>
         <label>Option position</label>
-        <select name="optionKeyDte" required>${optionOptions}</select>
+        <select name="optionKeyDte" data-required>${optionOptions}</select>
         <label>Warn me at N days to expiration</label>
-        <input name="dteThreshold" type="number" step="1" value="7" min="0" required>
+        <input name="dteThreshold" type="number" step="1" value="7" min="0" data-required>
       </div>
 
       <div class="actions"><button type="button" class="cancel">Cancel</button>
@@ -1000,7 +1000,16 @@ document.getElementById("add-alert").onclick = () => {
     (root) => {
       const select = root.querySelector("#alert-type-select");
       const groups = root.querySelectorAll(".alert-fieldset");
-      select.onchange = () => groups.forEach(g => { g.hidden = g.dataset.for !== select.value; });
+      // `hidden` alone doesn't exempt a field from constraint validation —
+      // a required-but-hidden field from an inactive type would silently
+      // block submission — so toggle `.required` itself with visibility.
+      const sync = () => groups.forEach(g => {
+        const active = g.dataset.for === select.value;
+        g.hidden = !active;
+        g.querySelectorAll("[data-required]").forEach(el => { el.required = active; });
+      });
+      select.onchange = sync;
+      sync();
     }
   );
 };
