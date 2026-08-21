@@ -89,6 +89,47 @@
       <div id="pulse-body" class="trends-list"></div>
     </section>
 
+    <section class="card" id="focus-ticker-card">
+      <div class="section-head">
+        <h2>Focus ticker &middot; <span class="tk" id="focus-ticker-label">AMC</span></h2>
+        <form id="focus-ticker-form" class="chart-search">
+          <input id="focus-ticker-input" type="text" placeholder="Change symbol…" autocomplete="off" maxlength="8">
+        </form>
+      </div>
+      <p class="delay-note">
+        Same IEX stock feed and indicative options feed as the rest of the dashboard, at finer
+        granularity for one symbol at a time.
+      </p>
+
+      <div class="focus-quote" id="focus-quote"></div>
+
+      <div class="chart-wrap">
+        <div class="chart-legend" id="focus-chart-legend"></div>
+        <div id="focus-chart-container" class="chart-container"></div>
+      </div>
+
+      <div class="subhead">Intraday technicals</div>
+      <p class="delay-note">
+        Finer-grained technical read for the focus ticker — RSI(14) on 1-minute and 5-minute
+        bars, distance from session VWAP, and a volume-surge flag, recomputed roughly every
+        minute. <strong>Not financial advice or a recommendation.</strong> These describe
+        momentum/trend patterns, not predictions; you decide every trade yourself.
+      </p>
+      <div id="focus-technicals" class="trends-list"></div>
+
+      <div class="subhead">Nearest weekly options &middot; near the money</div>
+      <p class="delay-note">
+        Alpaca's free "indicative" options feed (approximate, not true real-time OPRA). Sorted
+        by volume; <span class="warn">vol &gt; OI</span> flags strikes where today's volume
+        exceeds open interest — a common heuristic for unusual activity, not a buy/sell signal.
+      </p>
+      <table>
+        <thead><tr><th>Strike</th><th>Type</th><th class="num">Volume</th><th class="num">Open interest</th><th></th></tr></thead>
+        <tbody id="focus-options-body"></tbody>
+      </table>
+      <span id="focus-options-stamp" class="stamp"></span>
+    </section>
+
     <div class="grid-2">
       <section class="card">
         <div class="section-head">

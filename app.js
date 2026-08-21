@@ -18,6 +18,7 @@ const store = {
 };
 
 let state = {
+  focusTicker: store.get("md_focus_ticker", "AMC"),
   watchlist: store.get("md_watchlist", ["AAPL", "NVDA", "SPY", "TSLA", "AMD"]),
   stocks: store.get("md_stocks", []),       // {ticker, shares, costBasis}
   options: store.get("md_options", []),     // {ticker, expiry, strike, type, contracts, premium}
@@ -30,6 +31,7 @@ let state = {
 };
 
 function persist() {
+  store.set("md_focus_ticker", state.focusTicker);
   store.set("md_watchlist", state.watchlist);
   store.set("md_stocks", state.stocks);
   store.set("md_options", state.options);
@@ -58,7 +60,11 @@ async function fetchQuotes(symbols) {
     // the session and is most meaningful later in the day. That's an inherent
     // property of comparing a running total to a historical average, not a bug.
     const todayVolume = snap.dailyBar && snap.dailyBar.v != null ? snap.dailyBar.v : null;
-    out[sym] = { price, bid, ask, prevClose, todayVolume };
+    // Today's daily bar so far — gives an intraday high/low for the day-range
+    // meter, same partial-day caveat as todayVolume above.
+    const dayHigh = snap.dailyBar && snap.dailyBar.h != null ? parseFloat(snap.dailyBar.h) : null;
+    const dayLow = snap.dailyBar && snap.dailyBar.l != null ? parseFloat(snap.dailyBar.l) : null;
+    out[sym] = { price, bid, ask, prevClose, todayVolume, dayHigh, dayLow };
   }
   return out;
 }
@@ -128,7 +134,7 @@ function allKnownTickers() {
   // price/volume alerts carry a bare `.ticker`; iv/dte alerts carry `.optionKey`
   // instead, so this naturally excludes them.
   const alertTickers = state.alerts.filter(a => a.ticker).map(a => a.ticker);
-  return [...new Set([...state.watchlist, ...state.stocks.map(s => s.ticker), ...alertTickers])];
+  return [...new Set([state.focusTicker, ...state.watchlist, ...state.stocks.map(s => s.ticker), ...alertTickers])];
 }
 
 function renderTickerTape(quotes) {
@@ -842,6 +848,320 @@ const maybeUpdateTrends = makeThrottledUpdater(5 * 60000, updateTrends, "trend")
 const maybeUpdatePulse = makeThrottledUpdater(5 * 60000, updatePulse, "pulse");
 
 // ============================================================================
+// FOCUS TICKER — one symbol tracked at finer granularity than the watchlist.
+// Quote strip refreshes on the normal 15s cycle (reuses the same /api/quotes
+// call every other section already makes); bars and options are their own,
+// slower-cadence fetches so this panel doesn't multiply request volume.
+// ============================================================================
+const FOCUS_BARS_MS = 60000;    // 1-minute bars don't change faster than this
+const FOCUS_OPTIONS_MS = 150000; // 2.5 min — options chain moves slowly
+const FOCUS_CHART_RANGE_1M = { timeframe: "1Min", intraday: true, singleSession: true, lookbackDays: 5, intervalLabel: "1m" };
+const FOCUS_CHART_RANGE_5M = { timeframe: "5Min", intraday: true, singleSession: true, lookbackDays: 5, intervalLabel: "5m" };
+const FOCUS_OPTIONS_NEAR_COUNT = 16; // nearest-to-spot contracts kept before sorting by volume
+
+let lastQuotes = {};
+let focusBars = [];
+let focusChartRange = FOCUS_CHART_RANGE_1M;
+let focusOptionsChain = null;
+let focusChart, focusPriceSeries, focusVolumeSeries, focusVwapSeries;
+let focusRefLines = [];
+
+function computeSessionVWAP(bars, range) {
+  let cumPV = 0, cumV = 0;
+  return bars.map(b => {
+    const tp = (b.h + b.l + b.c) / 3;
+    cumPV += tp * b.v;
+    cumV += b.v;
+    return { time: toChartTime(b.t, range), value: cumV ? cumPV / cumV : tp };
+  });
+}
+
+function detectVolumeSurge(bars) {
+  if (!bars.length) return { flagged: false, count: 0 };
+  const avg = bars.reduce((s, b) => s + b.v, 0) / bars.length;
+  const surges = avg > 0 ? bars.filter(b => b.v > avg * 3) : [];
+  return { flagged: surges.length > 0, count: surges.length, avg };
+}
+
+// ---- Quote strip ----------------------------------------------------------
+function renderFocusQuote(quotes) {
+  document.getElementById("focus-ticker-label").textContent = state.focusTicker;
+  const el = document.getElementById("focus-quote");
+  const q = quotes[state.focusTicker];
+  if (!q) { el.innerHTML = `<p class="muted">No quote yet for ${escapeHtml(state.focusTicker)}.</p>`; return; }
+
+  const chg = q.prevClose ? q.price - q.prevClose : 0;
+  const pct = q.prevClose ? (chg / q.prevClose) * 100 : 0;
+  const hasQuote = !!(q.bid && q.ask);
+  const spreadCents = hasQuote ? (q.ask - q.bid) * 100 : null;
+  const spreadPct = hasQuote && q.price ? ((q.ask - q.bid) / q.price) * 100 : null;
+  const avgVol20 = trendCache[state.focusTicker] && trendCache[state.focusTicker].avgVolume20;
+  const volRatio = q.todayVolume != null && avgVol20 ? q.todayVolume / avgVol20 : null;
+  const hasRange = q.dayHigh != null && q.dayLow != null && q.dayHigh > q.dayLow;
+  const rangePos = hasRange ? Math.max(0, Math.min(100, ((q.price - q.dayLow) / (q.dayHigh - q.dayLow)) * 100)) : 50;
+
+  el.innerHTML = `
+    <div class="focus-price-row">
+      <span class="focus-price mono ${pnlClass(chg)}">${money(q.price)}</span>
+      <span class="focus-chg mono ${pnlClass(chg)}">${chg >= 0 ? "+" : ""}${chg.toFixed(2)} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)</span>
+    </div>
+    <div class="focus-metrics">
+      <div class="focus-metric"><span class="lbl">Bid &times; Ask</span><span class="mono">${q.bid ? money(q.bid) : "—"} &times; ${q.ask ? money(q.ask) : "—"}</span></div>
+      <div class="focus-metric"><span class="lbl">Spread</span><span class="mono">${spreadCents != null ? `${spreadCents.toFixed(1)}&cent; (${spreadPct.toFixed(2)}%)` : "—"}</span></div>
+      <div class="focus-metric"><span class="lbl">Volume vs 20d avg</span><span class="mono">${volRatio != null ? `${volRatio.toFixed(1)}&times; avg` : "—"}</span></div>
+    </div>
+    <div class="focus-range">
+      <div class="focus-range-labels">
+        <span class="mono">${hasRange ? money(q.dayLow) : "—"}</span>
+        <span class="muted">Day range</span>
+        <span class="mono">${hasRange ? money(q.dayHigh) : "—"}</span>
+      </div>
+      <div class="focus-range-strip"><div class="focus-range-marker" style="left:${rangePos}%"></div></div>
+    </div>`;
+}
+
+// ---- Intraday chart ---------------------------------------------------
+function ensureFocusChart() {
+  if (focusChart || typeof LightweightCharts === "undefined") return;
+  const el = document.getElementById("focus-chart-container");
+  focusChart = LightweightCharts.createChart(el, {
+    layout: { background: { color: "transparent" }, textColor: "#8b96ad", fontFamily: "'JetBrains Mono', Consolas, monospace" },
+    grid: {
+      vertLines: { color: "rgba(37, 49, 80, 0.5)" },
+      horzLines: { color: "rgba(37, 49, 80, 0.5)" },
+    },
+    rightPriceScale: { borderColor: "#253150" },
+    timeScale: { borderColor: "#253150", timeVisible: true },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    autoSize: true,
+  });
+  focusPriceSeries = focusChart.addCandlestickSeries({
+    upColor: "#3ecfb2", downColor: "#ff7a6e",
+    borderUpColor: "#3ecfb2", borderDownColor: "#ff7a6e",
+    wickUpColor: "#3ecfb2", wickDownColor: "#ff7a6e",
+  });
+  focusVolumeSeries = focusChart.addHistogramSeries({
+    priceFormat: { type: "volume" },
+    priceScaleId: "",
+    color: "#253150",
+  });
+  focusVolumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  focusVwapSeries = focusChart.addLineSeries({
+    color: "#f4b860", lineWidth: 1.5,
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+  });
+  focusChart.subscribeCrosshairMove(param => {
+    if (!focusBars.length) return;
+    if (!param || !param.time) { updateFocusLegend(focusBars[focusBars.length - 1]); return; }
+    const match = focusBars.find(b => toChartTime(b.t, focusChartRange) === param.time);
+    updateFocusLegend(match || focusBars[focusBars.length - 1]);
+  });
+}
+
+function updateFocusLegend(bar) {
+  const el = document.getElementById("focus-chart-legend");
+  if (!bar) { el.innerHTML = ""; return; }
+  el.innerHTML = `<span class="tk">${escapeHtml(state.focusTicker)}</span>
+    <span>${escapeHtml(focusChartRange.intervalLabel)}</span>
+    <span>O <strong class="mono">${money(bar.o)}</strong></span>
+    <span>H <strong class="mono">${money(bar.h)}</strong></span>
+    <span>L <strong class="mono">${money(bar.l)}</strong></span>
+    <span>C <strong class="mono ${pnlClass(bar.c - bar.o)}">${money(bar.c)}</strong></span>
+    <span>Vol <strong class="mono">${Number(bar.v).toLocaleString()}</strong></span>`;
+}
+
+function drawFocusChart() {
+  if (!focusChart) return;
+  focusRefLines.forEach(pl => { try { focusPriceSeries.removePriceLine(pl); } catch { /* series was swapped */ } });
+  focusRefLines = [];
+
+  if (!focusBars.length) {
+    focusPriceSeries.setData([]); focusVolumeSeries.setData([]); focusVwapSeries.setData([]);
+    updateFocusLegend(null);
+    return;
+  }
+
+  focusPriceSeries.setData(focusBars.map(b => ({ time: toChartTime(b.t, focusChartRange), open: b.o, high: b.h, low: b.l, close: b.c })));
+  focusVolumeSeries.setData(focusBars.map(b => ({
+    time: toChartTime(b.t, focusChartRange), value: b.v,
+    color: b.c >= b.o ? "rgba(62, 207, 178, 0.5)" : "rgba(255, 122, 110, 0.5)",
+  })));
+  focusVwapSeries.setData(computeSessionVWAP(focusBars, focusChartRange));
+
+  const sessionHigh = Math.max(...focusBars.map(b => b.h));
+  const sessionLow = Math.min(...focusBars.map(b => b.l));
+  focusRefLines.push(focusPriceSeries.createPriceLine({
+    price: sessionHigh, color: "#8b96ad", lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: "session high",
+  }));
+  focusRefLines.push(focusPriceSeries.createPriceLine({
+    price: sessionLow, color: "#8b96ad", lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: "session low",
+  }));
+
+  updateFocusLegend(focusBars[focusBars.length - 1]);
+  focusChart.timeScale().fitContent();
+}
+
+// ---- Technicals ---------------------------------------------------------
+function renderFocusTechnicals() {
+  const el = document.getElementById("focus-technicals");
+  if (!focusBars.length) {
+    el.innerHTML = `<p class="muted">Tracking — waiting on intraday bars for ${escapeHtml(state.focusTicker)}.</p>`;
+    return;
+  }
+  const closes = focusBars.map(b => b.c);
+  const rsiFast = latestRSI(closes, 14);
+  const rsi5m = pulseCache[state.focusTicker] ? pulseCache[state.focusTicker].rsi : null;
+  const vwapSeries = computeSessionVWAP(focusBars, focusChartRange);
+  const vwap = vwapSeries.length ? vwapSeries[vwapSeries.length - 1].value : null;
+  const price = closes[closes.length - 1];
+  const vwapDist = vwap ? ((price - vwap) / vwap) * 100 : null;
+  const surge = detectVolumeSurge(focusBars);
+  const fastLabel = focusChartRange.intervalLabel;
+
+  el.innerHTML = `<div class="trend-item ${surge.flagged ? "warn" : ""}">
+    <div class="trend-head">
+      <span class="tk">${escapeHtml(state.focusTicker)} &middot; intraday</span>
+      <span class="trend-badge ${surge.flagged ? "loss" : "muted"}">${surge.flagged ? "Volume surge" : "Normal volume"}</span>
+    </div>
+    <div class="trend-meta">
+      <span>RSI ${fastLabel} <strong class="mono">${rsiFast != null ? rsiFast.toFixed(0) : "—"}</strong></span>
+      <span>RSI 5m <strong class="mono">${rsi5m != null ? rsi5m.toFixed(0) : "—"}</strong></span>
+      <span>VWAP dist <strong class="mono ${vwapDist != null ? pnlClass(vwapDist) : ""}">${vwapDist != null ? `${vwapDist >= 0 ? "+" : ""}${vwapDist.toFixed(2)}%` : "—"}</strong></span>
+    </div>
+    ${surge.flagged ? `<div class="trend-warn">&#9650; ${surge.count} one-minute bar${surge.count > 1 ? "s" : ""} exceeded 3&times; the session's average 1-min volume — describes momentum, not a prediction.</div>` : ""}
+  </div>`;
+}
+
+// ---- Options activity snapshot ------------------------------------------
+function nextFridayExpiry(weeksAhead = 0) {
+  const d = new Date();
+  const diff = (5 - d.getDay() + 7) % 7; // days until (or including) this week's Friday
+  d.setDate(d.getDate() + diff + weeksAhead * 7);
+  return d.toISOString().slice(0, 10);
+}
+
+async function fetchOptionContracts(ticker, expiry) {
+  const res = await fetch(`${WORKER_URL}/api/option-contracts?symbol=${encodeURIComponent(ticker)}&expiration=${expiry}`);
+  if (!res.ok) throw new Error(`option contracts fetch failed: ${res.status}`);
+  const data = await res.json();
+  return data.option_contracts || [];
+}
+
+// Tries the next few Fridays until one actually has listed contracts (not
+// every ticker has weeklies every week) — merges Trading-API contract
+// reference data (open interest) with the Data-API snapshot (volume), then
+// keeps only the strikes nearest the current spot before sorting by volume.
+async function fetchFocusOptionsChain(ticker, spot) {
+  for (let weeksAhead = 0; weeksAhead < 3; weeksAhead++) {
+    const expiry = nextFridayExpiry(weeksAhead);
+    try {
+      const contracts = await fetchOptionContracts(ticker, expiry);
+      if (!contracts.length) continue;
+      const snaps = await fetchOptionSnapshot(ticker, expiry);
+      const rows = contracts
+        .map(c => ({
+          symbol: c.symbol,
+          strike: parseFloat(c.strike_price),
+          type: c.type,
+          oi: parseInt(c.open_interest || "0", 10),
+        }))
+        .sort((a, b) => Math.abs(a.strike - spot) - Math.abs(b.strike - spot))
+        .slice(0, FOCUS_OPTIONS_NEAR_COUNT)
+        .map(c => {
+          const snap = snaps[c.symbol];
+          const volume = snap && snap.dailyBar && snap.dailyBar.v != null ? snap.dailyBar.v : 0;
+          return { ...c, volume };
+        })
+        .sort((a, b) => b.volume - a.volume);
+      return { expiry, rows };
+    } catch (e) {
+      console.warn(`options chain fetch failed for ${ticker} @ ${expiry}:`, e);
+    }
+  }
+  return null;
+}
+
+function renderFocusOptions(chain) {
+  const stamp = document.getElementById("focus-options-stamp");
+  const body = document.getElementById("focus-options-body");
+  if (!chain || !chain.rows.length) {
+    body.innerHTML = `<tr><td colspan="5" class="muted">No near-the-money options data available.</td></tr>`;
+    stamp.textContent = "";
+    return;
+  }
+  stamp.textContent = `Expiry ${chain.expiry} · Updated ${new Date().toLocaleTimeString()}`;
+  body.innerHTML = chain.rows.map(r => `
+    <tr>
+      <td class="mono">${money(r.strike)}</td>
+      <td>${r.type === "call" ? "Call" : "Put"}</td>
+      <td class="num mono">${r.volume.toLocaleString()}</td>
+      <td class="num mono">${r.oi.toLocaleString()}</td>
+      <td>${r.volume > r.oi ? `<span class="news-tag warn-tag">vol &gt; OI</span>` : ""}</td>
+    </tr>`).join("");
+}
+
+// ---- Update cycles (own cadence, independent of the 15s quote refresh) ---
+async function updateFocusBars() {
+  const symbol = state.focusTicker;
+  let bars = [], range = FOCUS_CHART_RANGE_1M;
+  try {
+    bars = await fetchBars(symbol, FOCUS_CHART_RANGE_1M);
+  } catch (e) {
+    console.warn(`1m bars failed for ${symbol}, falling back to 5m:`, e);
+    try {
+      bars = await fetchBars(symbol, FOCUS_CHART_RANGE_5M);
+      range = FOCUS_CHART_RANGE_5M;
+    } catch (e2) {
+      console.warn(`5m bars fallback failed for ${symbol}:`, e2);
+    }
+  }
+  if (symbol !== state.focusTicker) return; // user switched tickers mid-fetch
+  focusBars = bars;
+  focusChartRange = range;
+  ensureFocusChart();
+  drawFocusChart();
+  renderFocusTechnicals();
+}
+
+async function updateFocusOptions() {
+  const symbol = state.focusTicker;
+  const spot = lastQuotes[symbol] ? lastQuotes[symbol].price : null;
+  if (!spot) return;
+  const chain = await fetchFocusOptionsChain(symbol, spot);
+  if (symbol !== state.focusTicker) return;
+  focusOptionsChain = chain;
+  renderFocusOptions(chain);
+}
+
+const maybeUpdateFocusBars = makeThrottledUpdater(FOCUS_BARS_MS, updateFocusBars, "focus bars");
+const maybeUpdateFocusOptions = makeThrottledUpdater(FOCUS_OPTIONS_MS, updateFocusOptions, "focus options");
+
+function selectFocusTicker(sym) {
+  state.focusTicker = sym.trim().toUpperCase();
+  if (!state.focusTicker) return;
+  persist();
+  focusBars = [];
+  focusOptionsChain = null;
+  drawFocusChart();
+  renderFocusTechnicals();
+  renderFocusOptions(null);
+  updateFocusBars();
+  updateFocusOptions();
+  refresh();
+}
+
+document.getElementById("focus-ticker-form").onsubmit = (e) => {
+  e.preventDefault();
+  const input = document.getElementById("focus-ticker-input");
+  const sym = input.value.trim();
+  if (!sym) return;
+  input.value = "";
+  selectFocusTicker(sym);
+};
+
+// ============================================================================
 // NEWS
 // ============================================================================
 function escapeHtml(str) {
@@ -911,12 +1231,14 @@ async function refresh() {
   try {
     const alertTickers = state.alerts.filter(a => a.ticker).map(a => a.ticker);
     const allTickers = [...new Set([
+      state.focusTicker,
       ...state.watchlist,
       ...state.stocks.map(s => s.ticker),
       ...state.options.map(o => o.ticker),
       ...alertTickers,
     ])];
     const quotes = await fetchQuotes(allTickers);
+    lastQuotes = quotes;
 
     // Option marks + IV: fetch each unique (ticker, expiry) chain once, then
     // pull each contract's mark/IV out of that shared snapshot.
@@ -935,6 +1257,7 @@ async function refresh() {
       optionIVs[optionKeyFor(o)] = ivFromSnapshot(snap);
     }
 
+    renderFocusQuote(quotes);
     renderWatchlist(quotes);
     renderTickerTape(quotes);
     const stockPnl = renderStocks(quotes);
@@ -949,6 +1272,8 @@ async function refresh() {
     maybeLoadNews();
     maybeUpdateTrends();
     maybeUpdatePulse();
+    maybeUpdateFocusBars();
+    maybeUpdateFocusOptions();
 
     const total = stockPnl + optionPnl;
     const totalEl = document.getElementById("total-pnl");

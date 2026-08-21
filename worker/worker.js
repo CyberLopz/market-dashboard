@@ -14,6 +14,12 @@
  *        (free tier = "indicative" feed, not true real-time OPRA —
  *        see README for what that means)
  *
+ *   GET /api/option-contracts?symbol=AAPL&expiration=2026-09-18
+ *     -> contract reference data for that expiry, notably open_interest —
+ *        NOT available on /api/options (the market-data snapshot endpoint
+ *        has no open-interest field at all). This hits Alpaca's *Trading*
+ *        API host instead of the data host, using the same key pair.
+ *
  *   GET /api/bars?symbol=AAPL&timeframe=1Day&limit=180
  *     -> historical OHLCV bars for the candlestick chart
  *
@@ -34,6 +40,12 @@
  */
 
 const ALPACA_BASE = "https://data.alpaca.markets";
+// Open interest lives only on the *Trading* API (reference data on the
+// contract itself), not the market-data snapshot endpoint above. The
+// README has you generate a paper-account key pair, and paper keys only
+// authenticate against the paper host — swap to https://api.alpaca.markets
+// if you later move to a live-account key pair.
+const ALPACA_TRADING_BASE = "https://paper-api.alpaca.markets";
 
 function corsHeaders(env) {
   return {
@@ -45,6 +57,20 @@ function corsHeaders(env) {
 
 async function alpacaFetch(env, path) {
   const resp = await fetch(`${ALPACA_BASE}${path}`, {
+    headers: {
+      "APCA-API-KEY-ID": env.ALPACA_KEY_ID,
+      "APCA-API-SECRET-KEY": env.ALPACA_SECRET_KEY,
+      "accept": "application/json",
+    },
+  });
+  if (!resp.ok) {
+    throw new Error(`Alpaca ${resp.status}: ${await resp.text()}`);
+  }
+  return resp.json();
+}
+
+async function alpacaTradingFetch(env, path) {
+  const resp = await fetch(`${ALPACA_TRADING_BASE}${path}`, {
     headers: {
       "APCA-API-KEY-ID": env.ALPACA_KEY_ID,
       "APCA-API-SECRET-KEY": env.ALPACA_SECRET_KEY,
@@ -93,6 +119,22 @@ async function handleBars(url, env) {
   });
 }
 
+async function handleOptionContracts(url, env) {
+  const symbol = url.searchParams.get("symbol");
+  const expiration = url.searchParams.get("expiration");
+  if (!symbol || !expiration) {
+    return new Response(JSON.stringify({ error: "missing symbol or expiration param" }), { status: 400 });
+  }
+  // Reference data only (open_interest, strike, type) — no quotes/greeks here,
+  // that's what /api/options is for. Callers merge the two by contract symbol.
+  const path = `/v2/options/contracts?underlying_symbols=${encodeURIComponent(symbol)}`
+    + `&expiration_date=${encodeURIComponent(expiration)}&status=active&limit=1000`;
+  const data = await alpacaTradingFetch(env, path);
+  return new Response(JSON.stringify(data), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 async function handleNews(url, env) {
   const symbols = url.searchParams.get("symbols");
   const limit = url.searchParams.get("limit") || "25";
@@ -133,6 +175,8 @@ export default {
         response = await handleQuotes(url, env);
       } else if (url.pathname === "/api/options") {
         response = await handleOptions(url, env);
+      } else if (url.pathname === "/api/option-contracts") {
+        response = await handleOptionContracts(url, env);
       } else if (url.pathname === "/api/bars") {
         response = await handleBars(url, env);
       } else if (url.pathname === "/api/news") {
