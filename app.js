@@ -791,7 +791,11 @@ async function updateCache(setCache, render, fetchBarsFor, periodLabel) {
   render();
 }
 const updateTrends = () => updateCache(c => (trendCache = c), renderTrends, fetchDailyBars, "50-day");
-const updatePulse = () => updateCache(c => (pulseCache = c), renderPulse, fetchPulseBars, "50-bar");
+// Also re-renders focus technicals: pulseCache is its source for the RSI 5m
+// stat, and pulseCache refreshes on this 5-min cycle, independent of the
+// focus panel's own 60s bars cycle — without this, RSI 5m would go stale
+// until the next bars refresh happens to land after a pulse refresh.
+const updatePulse = () => updateCache(c => (pulseCache = c), () => { renderPulse(); renderFocusTechnicals(); }, fetchPulseBars, "50-bar");
 
 function trendRank(t) {
   if (t.continuationWarning) return 0;
